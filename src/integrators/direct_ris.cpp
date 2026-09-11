@@ -186,9 +186,10 @@ public:
             // Convert from local BSDF coordinates to world coordinates and apply Mueller matrix transformation
             bsdf_val = si.to_world_mueller(bsdf_val, -wo, si.wi);
 
-            // Compute the MIS weight for the area sampling case
+            // Compute the MIS weight for the area sampling case, BSDF sampling cannot sample that direction from a delta surface (because it is impossible that it will match the perfect reflection direction, so p_bsdf(x) = 0)
+            // We have the BSDF sampling pdf to 0 for delta surfaces and therefore mis_area = p_emitter^2 / (p_emitter^2 + 0^2) = 1
             Float emitter_pdf = ds.pdf;
-            Float mis_area = mis_weight(emitter_pdf, bsdf_pdf, m_emitter_samples, m_bsdf_samples, 1);
+            Float mis_area = dr::select(ds.delta, Float(1.f), mis_weight(emitter_pdf, bsdf_pdf, m_emitter_samples, m_bsdf_samples));
 
             // Compute the weight of that candidate sample 
             Float w_xi = 1 / ds.pdf;
@@ -260,7 +261,7 @@ public:
 
                 // Compute the MIS weight for the BSDF sampling case
                 Float bsdf_pdf = bs.pdf;
-                Float mis_bsdf = mis_weight(bsdf_pdf, emitter_pdf, m_bsdf_samples, m_emitter_samples, 1);
+                Float mis_bsdf = mis_weight(bsdf_pdf, emitter_pdf, m_bsdf_samples, m_emitter_samples);
 
                 // Compute the weight of that candidate sample
                 Float w_xi = 1 / bs.pdf;
@@ -329,12 +330,12 @@ public:
         return oss.str();
     }
 
-    Float mis_weight(Float pdf_a, Float pdf_b, ScalarFloat n_a, ScalarFloat n_b, int pow) const {         
+    Float mis_weight(Float pdf_a, Float pdf_b, ScalarFloat n_a, ScalarFloat n_b, int pow = 2) const {         
         Float a = n_a * pdf_a;
         Float b = n_b * pdf_b;
 
-        // a = std::pow(a, pow);
-        // b = std::pow(b, pow);
+        a = dr::pow(a, pow);
+        b = dr::pow(b, pow);
 
         Float w = a / (a + b);
         return dr::select(dr::isfinite(w), w, 0.f);
