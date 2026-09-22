@@ -18,6 +18,9 @@ import nanogui as ng
 import numpy as np
 from nanogui.interop import FrameStream, drjit_sink
 
+import temp_reuse
+import ris_di
+
 VARIANTS = ("cuda_ad_rgb", "metal_ad_rgb", "llvm_ad_rgb")
 
 # Upper end of the samples/frame setting. Past this the producer thread
