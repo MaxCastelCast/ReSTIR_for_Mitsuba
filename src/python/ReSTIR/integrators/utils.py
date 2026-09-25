@@ -149,39 +149,69 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
         s.add_sample(r.select, reservoir_weight, sampler.next_1d(active_r), active_r)
 
         # Add the nb of samples of this reservoir to our combined reservoir nb
-        M_total += r.M
+        M_total += dr.select(active_r, r.M, 0.0)
 
     # Set the total number of samples for the combined reservoir
     s.M = M_total
 
+    active_s = active & (s.M > 0)
+
     # Compute the new contribution weight for the selected sample of the combined reservoir
-    p_hat_select = eval_p_hat(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_r)
-    active_s = active_r & (s.M > 0) & (p_hat_select > 0)
-    s.W = dr.select(active_s, s.w_sum/(s.M * dr.select(active_s, p_hat_select, 1.0)), 0.0)
+    p_hat_select = eval_p_hat(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_s)
+
+    active_s &= p_hat_select > 0
+    safe_M = dr.select(active_s, s.M, 1.0)
+    safe_p_hat = dr.select(active_s, p_hat_select, 1.0)
+
+    s.W = dr.select(active_s, s.w_sum / (safe_M * safe_p_hat), 0.0)
 
     return s    
 
 # Gathers the reservoirs associated with the indexes
-def gather_reservoir(r_set: Reservoir, index: mi.UInt32) -> Reservoir:
+def gather_reservoir(r_set: Reservoir, index: mi.UInt32, active: mi.Mask) -> Reservoir:
 
-    direction_sample_set = dr.gather(mi.DirectionSample3f, r_set.select.direction_sample, index)
-    pdf_set = dr.gather(mi.Float, r_set.select.pdf, index)
+    direction_sample_set = dr.gather(dtype=mi.DirectionSample3f, source=r_set.select.direction_sample, index=index, active=active)
+    pdf_set = dr.gather(dtype=mi.Float, source=r_set.select.pdf, index=index, active=active)
 
     candidate_set = Candidate(direction_sample=direction_sample_set, pdf=pdf_set)
-    w_sum_set = dr.gather(mi.Float, r_set.w_sum, index)
-    M_set = dr.gather(mi.Float, r_set.M, index)
-    W_set = dr.gather(mi.Float, r_set.W, index)
+    w_sum_set = dr.gather(dtype=mi.Float, source=r_set.w_sum, index=index, active=active)
+    M_set = dr.gather(dtype=mi.Float, source=r_set.M, index=index, active=active)
+    W_set = dr.gather(dtype=mi.Float, source=r_set.W, index=index, active=active)
 
     return Reservoir(select=candidate_set, w_sum=w_sum_set, W=W_set, M=M_set)
 
 # Store resulting reservoir for next frame
 # dr.scatter() modifies its target in place
-def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32):
+def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32, active: mi.Mask):
 
-    dr.scatter(previous.select.direction_sample, current.select.direction_sample, index)
-    dr.scatter(previous.select.pdf, current.select.pdf, index)
+    dr.scatter(previous.select.direction_sample, current.select.direction_sample, index, active=active)
+    dr.scatter(previous.select.pdf, current.select.pdf, index, active=active)
 
-    dr.scatter(previous.w_sum, current.w_sum, index)
-    dr.scatter(previous.M, current.M, index)
-    dr.scatter(previous.W, current.W, index)
+    dr.scatter(previous.w_sum, current.w_sum, index, active=active)
+    dr.scatter(previous.M, current.M, index, active=active)
+    dr.scatter(previous.W, current.W, index, active=active)
+
+def eval_previous_index(si: mi.SurfaceInteraction3f, sensor: mi.Sensor, sampler: mi.Sampler,  film_width: int, film_height: int, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
+
+    # Current world-space surface point -> previous sensor
+    ds, _ = sensor.sample_direction(si, mi.Point2f(0.0), active)
+
+    # Sensor could successfully connect to this point
+    valid = active & (ds.pdf > 0)
+
+    # Normalized film coordinates
+    x = ds.uv.x
+    y = ds.uv.y
+
+    # Reprojection must fall inside the image
+    valid &= ((x >= 0.0) & (x < film_width) & (y >= 0.0) & (y < film_height))
+
+     # Normalized film coordinates -> discrete pixel
+    previous_x = mi.UInt32(dr.clamp(x, 0, film_width - 1))
+    previous_y = mi.UInt32(dr.clamp(y, 0, film_height - 1))
+
+    # 2D pixel -> collumn-major reservoir index
+    previous_index = previous_x + previous_y * film_width
+
+    return previous_index, valid
 
