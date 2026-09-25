@@ -5,14 +5,17 @@ from dataclasses import dataclass, field
 from typing import Tuple, Union
 from utils import *
 
-mi.set_variant("llvm_ad_rgb")
 dr.set_flag(dr.JitFlag.Debug, True)
-
 
 class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
 
     # Grid containing the reservoirs of the previous frame
-    previousGrid: Reservoir
+    previousGrid: Reservoir = None
+    temporal_reuse_grid: Reservoir = None
+    spacial_reuse_grid: Reservoir = None
+    previous_camera: mi.Sensor = None
+
+    # Previous camera position
 
     def __init__(self, props):
         super().__init__(props)
@@ -46,6 +49,60 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
 
         # No previous frame exists initially
         self.previousGrid = None
+
+    def store_previous_camera(self, sensor: mi.Sensor, width: int, height: int) -> None:
+        """
+        Store an independent snapshot of the current camera so that it can be
+        used for temporal reprojection during the next frame.
+
+        The sensor passed by the viewer is modified in-place when the camera
+        moves, so simply doing
+
+            self.previous_camera = sensor
+
+        would not preserve the previous frame's camera.
+        """
+
+        # Create an independent perspective sensor.
+        previous_camera = mi.load_dict({
+            "type": "perspective",
+            "film": {
+                "type": "hdrfilm",
+                "width": width,
+                "height": height,
+            }
+        })
+
+        # Parameters of the current and previous cameras
+        current_params = mi.traverse(sensor)
+        previous_params = mi.traverse(previous_camera)
+
+        # print("CURRENT SENSOR PARAMS:")
+        # for key in current_params.keys():
+        #     print("  ", key)
+
+        # print("SNAPSHOT SENSOR PARAMS:")
+        # for key in previous_params.keys():
+        #     print("  ", key)
+
+        # Copy every camera parameter that exists in both sensors.
+        for key in previous_params.keys():
+            if key in current_params:
+                previous_params[key] = current_params[key]
+
+        # print("current to_world:",
+        #     sensor.world_transform().matrix)
+
+        # print("previous to_world BEFORE:",
+        #     previous_camera.world_transform().matrix)
+
+        previous_params.update()
+
+        # print("previous to_world AFTER:",
+        #     previous_camera.world_transform().matrix)
+
+        # Store the independent snapshot for the next frame.
+        self.previous_camera = previous_camera
 
     def sample_rays(
             self,
@@ -127,7 +184,7 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
     
             return ray, weight, splatting_pos, (pos.y + pos.x * film_size[0])
 
-    # Main rendering loom
+    # Main rendering loop
     def render(self: mi.SamplingIntegrator,
                    scene: mi.Scene,
                    sensor: Union[int, mi.Sensor] = 0,
@@ -154,7 +211,7 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
                     aovs=self.aov_names()
                 )
 
-                # ADDED : Initialize the previousGrid with the right size
+                # Initialize the previousGrid with the right size
                 film_size = film.crop_size()
                 width  = int(film_size[0])
                 height = int(film_size[1])
@@ -166,21 +223,25 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
     
                 # Generate a set of rays starting at the sensor + their discrete pixel indices
                 ray, weight, splatting_pos, pixel_index = self.sample_rays(scene, sensor, sampler)
-
-                # Get the reservoir from the previous frame corresponding to every ray
-                previous_reservoir = gather_reservoir(self.previousGrid, pixel_index)
                     
                 # Launch the Monte Carlo sampling process in primal mode
                 L, valid, current_reservoir, aovs = self.sample(
                     scene=scene,
                     sampler=sampler,
                     ray=ray,
-                    previous_reservoir=previous_reservoir,
+                    sensor=sensor,
+                    film_width=width,
+                    film_height=height,
                     active=mi.Bool(True)
                 )
 
+                # apply temporal reuse
+
                 # Store resulting reservoir for next frame
-                scatter_reservoir(self.previousGrid, current_reservoir, pixel_index)
+                scatter_reservoir(self.previousGrid, current_reservoir, pixel_index, valid)
+
+                # Store previous camera (done in viewer.py)
+                self.store_previous_camera(sensor, width, height)
     
                 # Prepare an ImageBlock as specified by the film
                 block = film.create_block()
@@ -207,7 +268,7 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
                 return film.develop()
         
 
-    def sample(self, scene : mi.Scene, sampler : mi.Sampler, ray : mi.RayDifferential3f, medium : mi.Medium =None, previous_reservoir : Reservoir = None, active : mi.Mask =True) -> tuple[mi.Spectrum, mi.Mask, Reservoir, list]:
+    def sample(self, scene : mi.Scene, sensor: mi.Sensor, sampler : mi.Sampler, ray : mi.RayDifferential3f, medium : mi.Medium = None, film_width: int = 0, film_height: int = 0,  active : mi.Mask =True) -> tuple[mi.Spectrum, mi.Mask, Reservoir, list]:
         """
         Main rendering routine for one vectorized set of rays.
 
@@ -333,18 +394,29 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
             # The added random number is needed to detemine if this candidate succesfully replaces the currently selected candidate or not
             current_reservoir.add_sample(candidate=candidate, reservoir_weight=reservoir_weight, rnd1D= sampler.next_1d(active_b), active= active_b)
 
-
-        ## Temportal Reuse ##
-
-        # Compute the final W of our current reservoir (needed for reservoir merging)
+        # Evaluate p_hat_(current si)
         p_hat_current = eval_p_hat(scene, si, current_reservoir.select, bsdf, bsdf_ctx, sampler, active)
+
+        # Evaluate the contribution weight W of the current reservoir
         current_reservoir.finalize(p_hat_current, active)
 
-        # Merge reservoirs
-        r = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active, current_reservoir, previous_reservoir)
+        ## Temportal Reuse ##
+        if self.previous_camera is not None:
+
+            # 1) Determine which temporal sample corresponds to our current pixel
+            previous_index, valid_reprojection = eval_previous_index(si, self.previous_camera, sampler, film_width, film_height, active)
+            post_cam_move_previous_reservoir = gather_reservoir(self.previousGrid, previous_index, valid_reprojection)
+
+            # 2) Merge this reservoir with the current reservoir
+            current_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active, current_reservoir, post_cam_move_previous_reservoir)
+
+        else:
+            current_reservoir.finalize(p_hat_current, active)
+
+        #######################
 
         ## Get the selected candidate ##
-        selected_candidate = r.select
+        selected_candidate = current_reservoir.select
 
         # To get the integral estimator, we need to compute I = f(X) * W_X
         p_hat_X_spectrum = eval_p_hat_spectrum(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
@@ -367,10 +439,10 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
         active_r = p_hat > 0.
 
         # the result is the product of the selected candidate's evaluation of the actual function f(x) and its contribution weight W_x
-        result += dr.select(active_r, f_X * r.W, 0.)
+        result += dr.select(active_r, f_X * current_reservoir.W, 0.)
         
 
-        return result, valid_ray, r, []
+        return result, valid_ray, current_reservoir, []
 
 
     def to_string(self):
