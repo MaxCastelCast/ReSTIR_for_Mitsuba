@@ -328,6 +328,7 @@ def replace_rgb(image: mi.TensorXf, rgb: mi.TensorXf) -> mi.TensorXf:
         id(integrator),
         spp,
     ),
+    enabled=False
 )
 def render_frame(
     scene: mi.Scene,

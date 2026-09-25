@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 mi.set_variant("llvm_ad_rgb")
 dr.set_flag(dr.JitFlag.Debug, True)
 
+POSITION_THRESHOLD = 0.05
+NORMAL_THRESHOLD = 0.9
+
 
 def mis_weight(pdf_a: mi.Float, pdf_b: mi.Float, n_a: float, n_b: float, power: int = 2) -> mi.Float:
     """Compute the MIS weight using the power heuristic."""
@@ -90,23 +93,29 @@ class Reservoir:
 # Evaluate candidate samples that was from an other sample space in the current sample space
 def eval_p_hat_spectrum(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Candidate, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Spectrum:
     # Get the direction sample of the candidate
-    ds = candidate.direction_sample
+    ds_old = candidate.direction_sample
 
     # Candidate validity
     active_p = active & (candidate.pdf > 0.)
 
     # /!\ : The current ds.d is in the previous sample space, and not in the current sample space, so we 
     #       must convert the direction from "ds.p - previous_si.p" to "ds.p - current_si.p"
-    d = dr.normalize(ds.p - current_si.p)
+    delta = ds_old.p - current_si.p
+    dist = dr.norm(delta)
+    d = delta / dist
+    ds = mi.DirectionSample3f(ds_old)
+
+    ds.d = d
+    ds.dist = dist
 
     # Determine the bsdf of that direction (those results are given in local coordinates)
-    wo = current_si.to_local(d)
+    wo = current_si.to_local(ds.d)
     bsdf_val, bsdf_pdf = bsdf.eval_pdf(bsdf_ctx, current_si, wo, active_p)
 
     # Convert from local BSDF coordinates to world coordinates and apply Mueller matrix transformation
     bsdf_val = current_si.to_world_mueller(bsdf_val, -wo, current_si.wi)
 
-    emitter_val = ds.emitter.eval_direction(current_si, ds, active_p)
+    emitter_val = ds_old.emitter.eval_direction(current_si, ds, active_p)
 
     # Actual numerator
     p_hat_spectrum = bsdf_val * emitter_val
@@ -191,10 +200,10 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
     dr.scatter(previous.M, current.M, index, active=active)
     dr.scatter(previous.W, current.W, index, active=active)
 
-def eval_previous_index(si: mi.SurfaceInteraction3f, sensor: mi.Sensor, sampler: mi.Sampler,  film_width: int, film_height: int, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
+def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor, current_sensor: mi.Sensor, sampler: mi.Sampler,  film_width: int, film_height: int, pixel_index: mi.UInt32, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
 
     # Current world-space surface point -> previous sensor
-    ds, _ = sensor.sample_direction(si, mi.Point2f(0.0), active)
+    ds, _ = previous_sensor.sample_direction(si, sampler.next_2d(active), active)
 
     # Sensor could successfully connect to this point
     valid = active & (ds.pdf > 0)
