@@ -11,8 +11,8 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
 
     # Grid containing the reservoirs of the previous frame
     previousGrid: Reservoir = None
-    temporal_reuse_grid: Reservoir = None
-    spacial_reuse_grid: Reservoir = None
+    #temporal_reuse_grid: Reservoir = None
+    #spacial_reuse_grid: Reservoir = None
     previous_camera: mi.Sensor = None
 
     # Previous camera position
@@ -77,29 +77,29 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
         current_params = mi.traverse(sensor)
         previous_params = mi.traverse(previous_camera)
 
-        # print("CURRENT SENSOR PARAMS:")
-        # for key in current_params.keys():
-        #     print("  ", key)
+        print("CURRENT SENSOR PARAMS:")
+        for key in current_params.keys():
+            print("  ", key)
 
-        # print("SNAPSHOT SENSOR PARAMS:")
-        # for key in previous_params.keys():
-        #     print("  ", key)
+        print("SNAPSHOT SENSOR PARAMS:")
+        for key in previous_params.keys():
+            print("  ", key)
 
         # Copy every camera parameter that exists in both sensors.
         for key in previous_params.keys():
             if key in current_params:
                 previous_params[key] = current_params[key]
 
-        # print("current to_world:",
-        #     sensor.world_transform().matrix)
+        print("current to_world:",
+            sensor.world_transform().matrix)
 
-        # print("previous to_world BEFORE:",
-        #     previous_camera.world_transform().matrix)
+        print("previous to_world BEFORE:",
+            previous_camera.world_transform().matrix)
 
         previous_params.update()
 
-        # print("previous to_world AFTER:",
-        #     previous_camera.world_transform().matrix)
+        print("previous to_world AFTER:",
+            previous_camera.world_transform().matrix)
 
         # Store the independent snapshot for the next frame.
         self.previous_camera = previous_camera
@@ -181,8 +181,10 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
     
             # With box filter, ignore random offset to prevent numerical instabilities
             splatting_pos = mi.Vector2f(pos) if rfilter.is_box_filter() else pos_f
+
+            pixel_index = pos.x + pos.y * film_size[0]
     
-            return ray, weight, splatting_pos, (pos.y + pos.x * film_size[0])
+            return ray, weight, splatting_pos, pixel_index
 
     # Main rendering loop
     def render(self: mi.SamplingIntegrator,
@@ -235,13 +237,13 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
                     active=mi.Bool(True)
                 )
 
-                # apply temporal reuse
+                # apply temporal reuse : TODO (separate the classic sampling from the spacial/temporal sampling)
 
                 # Store resulting reservoir for next frame
                 scatter_reservoir(self.previousGrid, current_reservoir, pixel_index, valid)
 
                 # Store previous camera (done in viewer.py)
-                self.store_previous_camera(sensor, width, height)
+                #self.store_previous_camera(sensor, width, height)
     
                 # Prepare an ImageBlock as specified by the film
                 block = film.create_block()
@@ -410,8 +412,8 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
             # 2) Merge this reservoir with the current reservoir
             current_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active, current_reservoir, post_cam_move_previous_reservoir)
 
-        else:
-            current_reservoir.finalize(p_hat_current, active)
+
+        print("TESSSST")
 
         #######################
 
