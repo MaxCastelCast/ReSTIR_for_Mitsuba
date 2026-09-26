@@ -225,26 +225,21 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
                 initial_reservoir, si, valid_ray, direct_emission = self.sample_initial_reservoir(scene, sampler, ray, mi.Bool(True))
 
                 sampler.schedule_state()
-                dr.eval(initial_reservoir.w_sum, initial_reservoir.M, initial_reservoir.W, initial_reservoir.select.pdf, initial_reservoir.select.direction_sample.p, initial_reservoir.select.direction_sample.d, initial_reservoir.select.direction_sample.dist,
-                    initial_reservoir.select.direction_sample.n, initial_reservoir.select.direction_sample.uv, si.p, si.n, si.sh_frame.n, si.wi, si.uv, 
-                    valid_ray, direct_emission)
+                dr.eval(initial_reservoir.w_sum, 
+                        initial_reservoir.M, 
+                        initial_reservoir.W, 
+                        initial_reservoir.select.pdf, 
+                        initial_reservoir.select.direction_sample.p, 
+                        initial_reservoir.select.direction_sample.d, 
+                        initial_reservoir.select.direction_sample.dist,
+                        initial_reservoir.select.direction_sample.n, 
+                        initial_reservoir.select.direction_sample.uv, 
+                        si.p, si.n, si.sh_frame.n, si.wi, si.uv, 
+                        valid_ray, direct_emission
+                    )
 
+                temporal_reservoir = self.sample_temporal_reuse(scene, sensor, sampler, ray, si, initial_reservoir, valid_ray, film_width, film_height, pixel_index)
 
-                # TODO : sampler.schedule_state() has internal state -> must be called before dr.eval (like a fence)
-                # TODO : call dr.eval to say what should be evaluated before next kernel & call (pass it all the needed variables that we will need later on (like the current_reservoir))
-
-                temporal_reservoir = self.sample_temporal_reuse(
-                    scene,
-                    sensor,
-                    sampler,
-                    ray,
-                    si,
-                    initial_reservoir,
-                    valid_ray,
-                    film_width,
-                    film_height,
-                    pixel_index
-                )
                 sampler.schedule_state()
                 dr.eval(
                     temporal_reservoir.w_sum,
@@ -260,15 +255,7 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
                 )
 
 
-                L = self.evaluate_reservoir(
-                        scene,
-                        sampler,
-                        ray,
-                        si,
-                        temporal_reservoir,
-                        valid_ray,
-                        direct_emission
-                    )
+                L = self.evaluate_reservoir(scene, sampler, ray, si, temporal_reservoir, valid_ray, direct_emission)
 
                 valid = valid_ray
                 aovs = []
@@ -277,7 +264,7 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
                 # Store resulting reservoir for next frame
                 scatter_reservoir(self.currentGrid, temporal_reservoir, pixel_index, valid_ray)
 
-
+                sampler.schedule_state()
                 dr.eval(
                     self.currentGrid.w_sum,
                     self.currentGrid.M,
@@ -290,16 +277,8 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
                     self.currentGrid.select.direction_sample.uv,
                 )
 
-                self.previousGrid, self.currentGrid = (
-                    self.currentGrid,
-                    self.previousGrid
-                )
-
-                self.store_previous_camera(
-                    sensor,
-                    film_width,
-                    film_height
-                )
+                self.previousGrid, self.currentGrid = (self.currentGrid, self.previousGrid)
+                self.store_previous_camera(sensor, film_width, film_height)
 
     
                 # Prepare an ImageBlock as specified by the film
@@ -490,19 +469,17 @@ class TemporalReuseIntegrator(mi.ad.integrators.common.ADIntegrator):
         previous_p = dr.gather(mi.Point3f, self.previousPosition, previous_index, valid_reprojection)
         previous_n = dr.gather(mi.Normal3f, self.previousNormal, previous_index, valid_reprojection)
 
-        position_error = dr.norm(previous_p - si.p)
-        normal_similarity = dr.dot(dr.normalize(previous_n), dr.normalize(si.n))
-
-        valid_history = (valid_reprojection & (position_error < POSITION_THRESHOLD) & (normal_similarity > NORMAL_THRESHOLD))
+        
+        # Use geometric check to verify if the temporal sample is useful for our current geometry
+        valid_history = validate_surface_similarity(si.p, si.n, previous_p, previous_n, valid_reprojection)
 
         # Gather previous-frame reservoir
         previous_reservoir = gather_reservoir(self.previousGrid, previous_index, valid_history)
 
         # 2) Merge this reservoir with the current reservoir
-        # TODO : why "active" as mask ? 
         combined = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , initial_reservoir, previous_reservoir)
 
-        temporal_reservoir = dr.select(valid_reprojection, combined, initial_reservoir)
+        temporal_reservoir = dr.select(valid_history, combined, initial_reservoir)
 
         return temporal_reservoir
 

@@ -224,3 +224,9 @@ def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor,
 
     return previous_index, valid
 
+def validate_surface_similarity(current_position: mi.Point3f, current_normal: mi.Normal3f, candidate_position: mi.Point3f, candidate_normal: mi.Normal3f, active: mi.Mask) -> mi.Mask:
+    position_error = dr.norm(candidate_position - current_position)
+    normal_similarity = dr.dot( dr.normalize(candidate_normal), dr.normalize(current_normal),)
+
+    return (active & (position_error < POSITION_THRESHOLD) & (normal_similarity > NORMAL_THRESHOLD))
+
