@@ -9,7 +9,9 @@ dr.set_flag(dr.JitFlag.Debug, True)
 
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
-SAMPLE_NEIGHBOR_SQUARE_RADIUS = 5
+
+SPATIAL_NEIGHBOR_COUNT = 10
+SPATIAL_NEIGHBOR_RADIUS = 10
 
 class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
 
@@ -271,6 +273,7 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
                     spacial_reservoir.select.direction_sample.uv,
                 )
 
+
                 L = self.evaluate_reservoir(scene, sampler, ray, si, spacial_reservoir, valid_ray, direct_emission)
 
                 valid = valid_ray
@@ -442,10 +445,8 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
             # The added random number is needed to detemine if this candidate succesfully replaces the currently selected candidate or not
             current_reservoir.add_sample(candidate=candidate, reservoir_weight=reservoir_weight, rnd1D= sampler.next_1d(active_b), active= active_b)
 
-        # ============================================================
-        # Finalize initial reservoir
-        # ============================================================
-
+        
+        #  Compute the contribution weight W of the current reservoir
         p_hat_current = eval_p_hat(
             scene,
             si,
@@ -505,27 +506,32 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
         bsdf = si.bsdf(ray)
         bsdf_ctx = mi.BSDFContext()
 
-        # 1) Determine which spacial samples correspond t our current pixels
-        neighbor_index, valid_neighbors = eval_selected_neighbor(sampler, film_width, film_height, pixel_index, SAMPLE_NEIGHBOR_SQUARE_RADIUS, active)
+        # Create a list of reservoir to be combined later on at the end
+        reservoirs = [temporal_reservoir]
+        
+        # Concatenate the reservoir samples to be combined at the end
+        for _ in range(SPATIAL_NEIGHBOR_COUNT):
+            # 1) Determine which spacial samples correspond t our current pixels
+            neighbor_index, valid_neighbors = eval_selected_neighbor(sampler, film_width, film_height, pixel_index, SPATIAL_NEIGHBOR_RADIUS, active)
 
-        # /!\ We have to first check if we can use spacial reuse with geometry similarity tests 
-        previous_p = dr.gather(mi.Point3f, self.previousPosition, neighbor_index, valid_neighbors)
-        previous_n = dr.gather(mi.Normal3f, self.previousNormal, neighbor_index, valid_neighbors)
+            # /!\ We have to first check if we can use spacial reuse with geometry similarity tests 
+            previous_p = dr.gather(mi.Point3f, self.previousPosition, neighbor_index, valid_neighbors)
+            previous_n = dr.gather(mi.Normal3f, self.previousNormal, neighbor_index, valid_neighbors)
 
-        # Use geometric check to verify if the temporal sample is useful for our current geometry
-        valid_neighborhood = validate_surface_similarity(si.p, si.n, previous_p, previous_n, valid_neighbors)
+            # Use geometric check to verify if the temporal sample is useful for our current geometry
+            valid_neighborhood = validate_surface_similarity(si.p, si.n, previous_p, previous_n, valid_neighbors)
 
-        # Gather the neighbors
-        neighbor_reservoirs = gather_reservoir(temporal_reservoir, neighbor_index, valid_neighborhood)
+            # Gather the neighbors
+            neighbor_reservoir = gather_reservoir(temporal_reservoir, neighbor_index, valid_neighborhood)
 
-        # 2) Merge neighbor reservoir with the current reservoir
-        combined = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , temporal_reservoir, neighbor_reservoirs)
+            # Append the reservoir to our list of reservoirs
+            reservoirs.append(neighbor_reservoir)
 
-        spacial_reservoir = dr.select(valid_neighborhood, combined, temporal_reservoir)
+
+        # 2) Merge all the neighbor reservoirs with the current reservoir
+        spacial_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , temporal_reservoir, *reservoirs)
 
         return spacial_reservoir
-
-
 
 
 
