@@ -224,6 +224,44 @@ def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor,
 
     return previous_index, valid
 
+# samples uniformly from a square neighborhood
+def eval_selected_neighbor(sampler: mi.Sampler,  film_width: int, film_height: int, pixel_index: mi.UInt32, radius: int, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
+    # 1) Recover integer screen coordinates from the linear pixel index
+    current_y = pixel_index // film_width
+    current_x = pixel_index - current_y * film_width
+
+    # 2) Randomly select an offset in [-radius, radius]
+    rnd = sampler.next_2d(active)
+
+    diameter = 2 * radius + 1
+
+    offset_x = mi.Int32(dr.floor(rnd.x * diameter)) - radius
+    offset_y = mi.Int32(dr.floor(rnd.y * diameter)) - radius
+
+    neighbor_x = mi.Int32(current_x) + offset_x
+    neighbor_y = mi.Int32(current_y) + offset_y
+
+    # 3) Check whether the selected neighbor exists
+    valid_neighbor = (
+        active
+        & (neighbor_x >= 0)
+        & (neighbor_x < film_width)
+        & (neighbor_y >= 0)
+        & (neighbor_y < film_height)
+    )
+
+    # Do not select the current pixel itself
+    valid_neighbor &= (offset_x != 0) | (offset_y != 0)
+
+    # 4) Convert back to a row-major linear index
+    # Clamp first so that inactive lanes still contain safe indices.
+    safe_x = dr.clamp(neighbor_x, 0, film_width - 1)
+    safe_y = dr.clamp(neighbor_y, 0, film_height - 1)
+
+    neighbor_index = (mi.UInt32(safe_x) + mi.UInt32(safe_y) * film_width)
+
+    return neighbor_index, valid_neighbor
+
 def validate_surface_similarity(current_position: mi.Point3f, current_normal: mi.Normal3f, candidate_position: mi.Point3f, candidate_normal: mi.Normal3f, active: mi.Mask) -> mi.Mask:
     position_error = dr.norm(candidate_position - current_position)
     normal_similarity = dr.dot( dr.normalize(candidate_normal), dr.normalize(current_normal),)

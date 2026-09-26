@@ -20,6 +20,7 @@ from nanogui.interop import FrameStream, drjit_sink
 
 import temp_reuse
 import ris_di
+import restir_di
 
 VARIANTS = ("cuda_ad_rgb", "metal_ad_rgb", "llvm_ad_rgb")
 
@@ -39,6 +40,7 @@ INTEGRATORS = (
     IntegratorChoice("Path tracer", "path"),
     IntegratorChoice("RIS DI", "direct_ris"),
     IntegratorChoice("Temporal Reuse", "temp_reuse"),
+    IntegratorChoice("ReSTIR DI", "restir_di")
 )
 
 
