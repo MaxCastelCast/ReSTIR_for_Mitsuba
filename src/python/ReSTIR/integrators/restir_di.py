@@ -5,8 +5,6 @@ from dataclasses import dataclass, field
 from typing import Tuple, Union
 from utils import *
 
-dr.set_flag(dr.JitFlag.Debug, True)
-
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
 
@@ -18,9 +16,6 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
     # Grid containing the reservoirs of the previous frame
     previousGrid: Reservoir = None
     currentGrid: Reservoir = None
-
-    previousPosition: mi.Point3f = None
-    previousNormal: mi.Normal3f = None
     
     previous_camera: mi.Sensor = None
 
@@ -234,6 +229,8 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
                         initial_reservoir.M, 
                         initial_reservoir.W, 
                         initial_reservoir.select.pdf, 
+                        initial_reservoir.select.surface_position,
+                        initial_reservoir.select.surface_normal,
                         initial_reservoir.select.direction_sample.p, 
                         initial_reservoir.select.direction_sample.d, 
                         initial_reservoir.select.direction_sample.dist,
@@ -251,6 +248,8 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
                     temporal_reservoir.M,
                     temporal_reservoir.W,
                     temporal_reservoir.select.pdf,
+                    temporal_reservoir.select.surface_position,
+                    temporal_reservoir.select.surface_normal,
 
                     temporal_reservoir.select.direction_sample.p,
                     temporal_reservoir.select.direction_sample.d,
@@ -267,6 +266,8 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
                     spacial_reservoir.M,
                     spacial_reservoir.W,
                     spacial_reservoir.select.pdf,
+                    spacial_reservoir.select.surface_position,
+                    spacial_reservoir.select.surface_normal,
 
                     spacial_reservoir.select.direction_sample.p,
                     spacial_reservoir.select.direction_sample.d,
@@ -336,9 +337,6 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
         valid_ray = active & si.is_valid()
         active &= si.is_valid()
 
-        # Returned pixel color (we accumulate on it)
-        result = mi.Spectrum(0.)
-
         # Add directly visible emission
         emitter = si.emitter(scene, active)
         direct_emission = emitter.eval(si, active)
@@ -349,7 +347,7 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
         bsdf_ctx = mi.BSDFContext()
 
         # Add the Emitter Samples inside the reservoir
-        for i in range(self.emitter_samples):
+        for _ in range(self.emitter_samples):
             # Sample an emitter point in the scene, we set visibility check to false because our target function is p_hat = BRDF(x) * L_e(x) * G(x)
             # ds : direction sample
             # emitter_weight : the pixel value at the emitter divided by the emitter sampling pdf : L_e(y) / pdf_emitter(y)
@@ -379,7 +377,7 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
             p_hat_and_wxi = mi.luminance(mi.unpolarized_spectrum(candidate_weight_spectrum), si.wavelengths, active_e); 
 
             # Construct the candidate structure for the reservoir sampling step
-            candidate = Candidate(ds, ds.pdf) 
+            candidate = Candidate(ds, ds.pdf, si.p, si.n) 
 
 
             # Compute the reservoir weight : w_i = mis_area * p_hat * w_xi (we must divide by the number of samples for the emitter case)
@@ -390,7 +388,7 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
             current_reservoir.add_sample(candidate= candidate, reservoir_weight= reservoir_weight, rnd1D= sampler.next_1d(active_e), active= active_e)
 
         # Add the BSDF Samples inside the reservoir
-        for i in range(self.bsdf_samples):
+        for _ in range(self.bsdf_samples):
             # Sample a bsdf point in the scene from the intersection point si
             # bs : bsdf sample obtained (not directly a direction sample!)
             # bsdf_weight : the bsdf evaluation divided by the probability of sampling that value : bs_val = BSDF(x) = p_bsdf(x)
@@ -438,7 +436,7 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
             p_hat_and_wxi = mi.luminance(mi.unpolarized_spectrum(candidate_weight_spectrum), si.wavelengths, active_b)
 
             # Construct the candidate for the reservoir
-            candidate = Candidate(ds, bs.pdf)
+            candidate = Candidate(ds, bs.pdf, si.p, si.n)
 
             # Compute the reservoir weight : w_i = mis_area * p_hat * w_xi (we must divide by the number of samples for the bsdf case)
             reservoir_weight = mis_bsdf * p_hat_and_wxi / self.bsdf_samples
@@ -464,10 +462,6 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
             active
         )
 
-        # TODO Temporary here, must be displaced later on
-        self.previousPosition = si.p
-        self.previousNormal = si.n
-
         return (current_reservoir, si, valid_ray, direct_emission)
 
 
@@ -484,22 +478,16 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
         # 1) Determine which temporal sample corresponds to our current pixel
         previous_index, valid_reprojection = eval_previous_index(si, self.previous_camera, sensor, sampler, film_width, film_height, pixel_index, active)
 
-        # /!\ We have to first check if we can use temporal reuse with geometry similarity tests 
+        # Gather previous-frame reservoir
+        previous_reservoir = gather_reservoir(self.previousGrid, previous_index, valid_reprojection)
 
-        previous_p = dr.gather(mi.Point3f, self.previousPosition, previous_index, valid_reprojection)
-        previous_n = dr.gather(mi.Normal3f, self.previousNormal, previous_index, valid_reprojection)
+        # /!\ We have to first check if we can use temporal reuse with geometry similarity tests 
+        # Use geometric check to verify if the temporal sample is useful for our current geometry
+        valid_history = validate_surface_similarity(si.p, si.n, previous_reservoir.select.surface_position, previous_reservoir.select.surface_normal, valid_reprojection)
 
         
-        # Use geometric check to verify if the temporal sample is useful for our current geometry
-        valid_history = validate_surface_similarity(si.p, si.n, previous_p, previous_n, valid_reprojection)
-
-        # Gather previous-frame reservoir
-        previous_reservoir = gather_reservoir(self.previousGrid, previous_index, valid_history)
-
         # 2) Merge this reservoir with the current reservoir
-        combined = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , initial_reservoir, previous_reservoir)
-
-        temporal_reservoir = dr.select(valid_history, combined, initial_reservoir)
+        temporal_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , (initial_reservoir, active), (previous_reservoir, valid_history))
 
         return temporal_reservoir
 
@@ -509,29 +497,26 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
         bsdf_ctx = mi.BSDFContext()
 
         # Create a list of reservoir to be combined later on at the end
-        reservoirs = [temporal_reservoir]
+        reservoirs = [(temporal_reservoir, active)]
         
         # Concatenate the reservoir samples to be combined at the end
         for _ in range(SPATIAL_NEIGHBOR_COUNT):
             # 1) Determine which spacial samples correspond t our current pixels
             neighbor_index, valid_neighbors = eval_selected_neighbor(sampler, film_width, film_height, pixel_index, SPATIAL_NEIGHBOR_RADIUS, active)
 
-            # /!\ We have to first check if we can use spacial reuse with geometry similarity tests 
-            previous_p = dr.gather(mi.Point3f, self.previousPosition, neighbor_index, valid_neighbors)
-            previous_n = dr.gather(mi.Normal3f, self.previousNormal, neighbor_index, valid_neighbors)
-
-            # Use geometric check to verify if the temporal sample is useful for our current geometry
-            valid_neighborhood = validate_surface_similarity(si.p, si.n, previous_p, previous_n, valid_neighbors)
-
             # Gather the neighbors
-            neighbor_reservoir = gather_reservoir(temporal_reservoir, neighbor_index, valid_neighborhood)
+            neighbor_reservoir = gather_reservoir(temporal_reservoir, neighbor_index, valid_neighbors)
+
+            # /!\ We have to first check if we can use spacial reuse with geometry similarity tests 
+            # Use geometric check to verify if the temporal sample is useful for our current geometry
+            valid_neighborhood = validate_surface_similarity(si.p, si.n, neighbor_reservoir.select.surface_position, neighbor_reservoir.select.surface_normal, valid_neighbors)
 
             # Append the reservoir to our list of reservoirs
-            reservoirs.append(neighbor_reservoir)
+            reservoirs.append((neighbor_reservoir, valid_neighborhood))
 
 
         # 2) Merge all the neighbor reservoirs with the current reservoir
-        spacial_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , temporal_reservoir, *reservoirs)
+        spacial_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active, *reservoirs)
 
         return spacial_reservoir
 
@@ -552,8 +537,6 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
         p_hat_X_spectrum = eval_p_hat_spectrum(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
         p_hat = eval_p_hat(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
 
-        # Add the visibility check to the selected candidate to determine f(X) = p_hat(X) * V(X)
-        f_X = mi.Spectrum(0.)
         
         # Trace a ray from the original intersection point to the selected candidate point and check for visibility
         shadow_ray = si.spawn_ray_to(selected_candidate.direction_sample.p)

@@ -3,7 +3,6 @@ import drjit as dr
 from dataclasses import dataclass, field
 
 mi.set_variant("llvm_ad_rgb")
-dr.set_flag(dr.JitFlag.Debug, True)
 
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
@@ -23,8 +22,6 @@ def mis_weight(pdf_a: mi.Float, pdf_b: mi.Float, n_a: float, n_b: float, power: 
 
     return dr.select(dr.isfinite(w), w, 0.0)
 
-from dataclasses import dataclass, field
-
 @dataclass
 class Candidate:
     # Direction sample of this candidate
@@ -32,6 +29,16 @@ class Candidate:
 
     # Original pdf of that sample
     pdf: mi.Float = field(default_factory=lambda: mi.Float(0.0))
+
+    # The position of the SI associated to the candidate
+    surface_position: mi.Point3f = field(
+        default_factory=mi.Point3f
+    )
+
+    # The surface normal of the SI associated to the candidate
+    surface_normal: mi.Normal3f = field(
+        default_factory=mi.Normal3f
+    )
  
 
 @dataclass
@@ -52,7 +59,9 @@ class Reservoir:
     def empty(width):
         candidate = Candidate(
             direction_sample=dr.zeros(mi.DirectionSample3f, width),
-            pdf=dr.zeros(mi.Float,  width)
+            pdf=dr.zeros(mi.Float,  width),
+            surface_position=dr.zeros(mi.Point3f, width),
+            surface_normal=dr.zeros(mi.Normal3f, width)
         )
 
         return Reservoir(
@@ -136,17 +145,17 @@ def eval_p_hat(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: 
     return p_hat_lum
 
 # Combines an arbitrary number of reservoir and returns the combined reservoirs
-def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask, *reservoirs : Reservoir) -> Reservoir:
+def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask, *reservoirs_mask_pairs : tuple[Reservoir, mi.Mask]) -> Reservoir:
     # Initialize the return reservoire
     width = dr.width(current_si.p)
     s = Reservoir.empty(width)
     M_total = dr.zeros(mi.Float, width)
 
     # Combine the reservoirs by adding their selected candidates and the associate reservoir weight
-    for r in reservoirs:
+    for r, valid_r in reservoirs_mask_pairs:
 
         # Reservoir exists only where it contains samples
-        active_r = active & (r.M > 0)
+        active_r = active & valid_r & (r.M > 0)
 
         # We need to evaluate p_hat for the current pixel/surface_interaction so that the candidates can be used for the current context 
         p_hat = eval_p_hat(scene, current_si, r.select, bsdf, bsdf_ctx, sampler, active_r)
@@ -181,8 +190,11 @@ def gather_reservoir(r_set: Reservoir, index: mi.UInt32, active: mi.Mask) -> Res
 
     direction_sample_set = dr.gather(dtype=mi.DirectionSample3f, source=r_set.select.direction_sample, index=index, active=active)
     pdf_set = dr.gather(dtype=mi.Float, source=r_set.select.pdf, index=index, active=active)
+    surface_position_set = dr.gather(dtype=mi.Point3f, source=r_set.select.surface_position, index=index, active=active)
+    surface_normal_set = dr.gather(dtype=mi.Normal3f, source=r_set.select.surface_normal, index=index, active=active)
 
-    candidate_set = Candidate(direction_sample=direction_sample_set, pdf=pdf_set)
+
+    candidate_set = Candidate(direction_sample=direction_sample_set, pdf=pdf_set, surface_position=surface_position_set, surface_normal=surface_normal_set)
     w_sum_set = dr.gather(dtype=mi.Float, source=r_set.w_sum, index=index, active=active)
     M_set = dr.gather(dtype=mi.Float, source=r_set.M, index=index, active=active)
     W_set = dr.gather(dtype=mi.Float, source=r_set.W, index=index, active=active)
@@ -195,6 +207,8 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
 
     dr.scatter(previous.select.direction_sample, current.select.direction_sample, index, active=active)
     dr.scatter(previous.select.pdf, current.select.pdf, index, active=active)
+    dr.scatter(previous.select.surface_position, current.select.surface_position, index, active=active)
+    dr.scatter(previous.select.surface_normal, current.select.surface_normal, index, active=active)
 
     dr.scatter(previous.w_sum, current.w_sum, index, active=active)
     dr.scatter(previous.M, current.M, index, active=active)
