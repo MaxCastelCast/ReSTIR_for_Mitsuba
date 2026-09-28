@@ -57,48 +57,47 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
             )
 
 
-    # def prepare_frame():
-    #     # TODO
-    # Give it the previous scensor 
+    def prepare_frame(self, sensor: mi.Sensor) -> None:
+        if self.previous_camera is not None:
+            return
 
-    # TODO : Changer que le transform au lieu d'utiliser .update() et .travers
-    # REMOVE .update et .traverse
-    def store_previous_camera(self, sensor: mi.Sensor, width: int, height: int) -> None:
-        """
-        Store an independent snapshot of the current camera so that it can be
-        used for temporal reprojection during the next frame.
+        if not isinstance(sensor, mi.ProjectiveCamera):
+            raise TypeError(
+                f"ReSTIR DI requires a ProjectiveCamera, got {type(sensor)}"
+            )
 
-        The sensor passed by the viewer is modified in-place when the camera
-        moves, so simply doing
+        film = sensor.film()
+        film_size = film.crop_size()
 
-            self.previous_camera = sensor
+        # Convert the JIT transform to a scalar CPU transform
+        to_world = mi.ScalarTransform4f(
+            dr.slice(sensor.world_transform().matrix, 0)
+        )
 
-        would not preserve the previous frame's camera.
-        """
-
-        # Create an independent perspective sensor.
-        previous_camera = mi.load_dict({
+        self.previous_camera = mi.load_dict({
             "type": "perspective",
+            "to_world": to_world,
             "film": {
                 "type": "hdrfilm",
-                "width": width,
-                "height": height,
+                "width": int(film_size[0]),
+                "height": int(film_size[1]),
             }
         })
 
-        # Parameters of the current and previous cameras
-        current_params = mi.traverse(sensor)
-        previous_params = mi.traverse(previous_camera)
 
-        # Copy every camera parameter that exists in both sensors.
-        for key in previous_params.keys():
-            if key in current_params:
-                previous_params[key] = current_params[key]
+    def prepare_next_frame(self, sensor: mi.Sensor) -> None:
+        if self.previous_camera is None:
+            return
 
-        previous_params.update()
+        # Extract current camera transform as a scalar transform
+        to_world = mi.ScalarTransform4f(
+            dr.slice(sensor.world_transform().matrix, 0)
+        )
 
-        # Store the independent snapshot for the next frame.
-        self.previous_camera = previous_camera
+        # Update previous_camera
+        params = mi.traverse(self.previous_camera)
+        params["to_world"] = mi.Transform4f(to_world)
+        params.update()
 
     def sample_rays(
             self,
@@ -219,6 +218,9 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
                 if self.previousGrid is None:
                     self.previousGrid = Reservoir.empty(pixel_count)
                     self.currentGrid  = Reservoir.empty(pixel_count)
+
+                # if self.previous_camera is None:
+                #     self.prepare_frame(sensor)
     
                 # Generate a set of rays starting at the sensor + their discrete pixel indices
                 ray, weight, splatting_pos, pixel_index = self.sample_rays(scene, sensor, sampler)
@@ -297,7 +299,7 @@ class Restir_Di_Integrator(mi.ad.integrators.common.ADIntegrator):
                 )
 
                 self.previousGrid, self.currentGrid = (self.currentGrid, self.previousGrid)
-                self.store_previous_camera(sensor, film_width, film_height)
+                #self.prepare_next_frame(sensor)
 
     
                 # Prepare an ImageBlock as specified by the film

@@ -330,7 +330,7 @@ def replace_rgb(image: mi.TensorXf, rgb: mi.TensorXf) -> mi.TensorXf:
         id(integrator),
         spp,
     ),
-    enabled=False
+    enabled=True
 )
 def render_frame(
     scene: mi.Scene,
@@ -347,6 +347,7 @@ def render_frame(
     ``spp`` sizes the sample array the integrator traces, so it is part of the
     frozen kernel rather than an input to it: changing it records a new one.
     """
+
     image = integrator.render(scene, sensor, seed=seed, spp=spp)
     height, width, _ = accum.shape
     image_channels = image.shape[-1]
@@ -694,6 +695,13 @@ class MitsubaRenderer:
         render_integrator = (
             self.aov_integrator if denoise and use_albedo else self.integrator
         )
+
+
+        # Initialize ReSTIR temporal state outside dr.freeze
+        if isinstance(self.integrator, restir_di.Restir_Di_Integrator):
+            if self.integrator.previous_camera is None:
+                self.integrator.prepare_frame(self.sensor)
+
         self.accum, albedo, normals = render_frame(
             self.scene,
             self.sensor,
@@ -704,6 +712,11 @@ class MitsubaRenderer:
             dr.opaque(mi.Float, self.frame_weight()),
             max(int(self.spp), 1),
         )
+
+        # Call Prepare next frame for ReSTIR
+        if isinstance(self.integrator, restir_di.Restir_Di_Integrator):
+            self.integrator.prepare_next_frame(self.sensor)
+
         if not denoise:
             return self.accum
         if self.denoiser is None or self.denoiser_config != config:
