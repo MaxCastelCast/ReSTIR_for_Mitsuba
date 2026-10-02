@@ -214,6 +214,7 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
     dr.scatter(previous.M, current.M, index, active=active)
     dr.scatter(previous.W, current.W, index, active=active)
 
+# Get the indexes of the previous frame reservoirs that correspond to the current frame pixels
 def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor, current_sensor: mi.Sensor, sampler: mi.Sampler,  film_width: int, film_height: int, pixel_index: mi.UInt32, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
 
     # Current world-space surface point -> previous sensor
@@ -222,14 +223,14 @@ def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor,
     # Sensor could successfully connect to this point
     valid = active & (ds.pdf > 0)
 
-    # Normalized film coordinates
+    # film coordinates
     x = ds.uv.x
     y = ds.uv.y
 
     # Reprojection must fall inside the image
     valid &= ((x >= 0.0) & (x < film_width) & (y >= 0.0) & (y < film_height))
 
-     # Normalized film coordinates -> discrete pixel
+     # film coordinates -> discrete pixel
     previous_x = mi.UInt32(dr.clamp(x, 0, film_width - 1))
     previous_y = mi.UInt32(dr.clamp(y, 0, film_height - 1))
 
@@ -276,6 +277,8 @@ def eval_selected_neighbor(sampler: mi.Sampler,  film_width: int, film_height: i
 
     return neighbor_index, valid_neighbor
 
+# Check if we can reuse a candidate from a previous sample space in the current sample space
+# Must be applied on the initaial vertice of a path x1
 def validate_surface_similarity(current_position: mi.Point3f, current_normal: mi.Normal3f, candidate_position: mi.Point3f, candidate_normal: mi.Normal3f, active: mi.Mask) -> mi.Mask:
     position_error = dr.norm(candidate_position - current_position)
     normal_similarity = dr.dot( dr.normalize(candidate_normal), dr.normalize(current_normal),)
