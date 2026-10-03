@@ -26,14 +26,17 @@ def mis_weight(pdf_a: mi.Float, pdf_b: mi.Float, n_a: float, n_b: float, power: 
 
 @dataclass
 class Sample:
-    # The position of the SI associated to the Sample
-    surface_position: mi.Point3f = field(default_factory=mi.Point3f)
+    # The position of the vertex x1
+    x1: mi.Point3f = field(default_factory=mi.Point3f)
     
-    # The surface normal of the SI associated to the Sample
-    surface_normal: mi.Normal3f = field(default_factory=mi.Normal3f)
+    # The surface normal at x1
+    x1_n: mi.Normal3f = field(default_factory=mi.Normal3f)
 
-    # Sampled emitter associated with the sample
-    direction_sample: mi.DirectionSample3f = field(default_factory=mi.DirectionSample3f)
+    # The position of the vertex x2
+    x2: mi.Point3f = field(default_factory=mi.Point3f)
+
+    # The surface normal at x2
+    x2_n: mi.Normal3f = field(default_factory=mi.Normal3f)
 
     # Original pdf of that sample
     pdf: mi.Float = field(default_factory=lambda: mi.Float(0.0))
@@ -41,57 +44,30 @@ class Sample:
     # unoccluded radiance contribution associated with that light sample
     radiance: mi.Spectrum = field(default_factory=lambda: mi.Spectrum(0.0))
 
+    # random numbers used for the BSDF event at x1
+    random_x1: mi.Vector3f = field(default_factory=mi.Vector3f)
+
+    # random numbers used for the BSDF event at x2
+    random_x2: mi.Vector3f = field(default_factory=mi.Vector3f)
+
+
     @staticmethod
     def make_empty_sample(width):
         return Sample(
-            surface_position=dr.zeros(mi.Point3f, width),
-            surface_normal=dr.zeros(mi.Normal3f, width),
-            direction_sample=dr.zeros(mi.DirectionSample3f, width),
+            x1=dr.zeros(mi.Point3f, width),
+            x1_n=dr.zeros(mi.Normal3f, width),
+            x2=dr.zeros(mi.Point3f, width),
+            x2_n=dr.zeros(mi.Normal3f, width),
             pdf=dr.zeros(mi.Float, width),
-            radiance=dr.zeros(mi.Spectrum, width)
+            radiance=dr.zeros(mi.Spectrum, width),
+            random_x1=dr.zeros(mi.Vector3f, width),
+            random_x2=dr.zeros(mi.Vector3f, width)
         )
-
-
-def select_sample(mask: mi.Mask, a: Sample, b: Sample) -> Sample:
-    return Sample(
-        surface_position=dr.select(mask, a.surface_position, b.surface_position),
-        surface_normal=dr.select(mask, a.surface_normal, b.surface_normal),
-        direction_sample=dr.select(mask, a.direction_sample, b.direction_sample),
-        pdf=dr.select(mask, a.pdf, b.pdf),
-        radiance=dr.select(mask, a.radiance, b.radiance)
-    )
-
-@dataclass
-class Path:
-    # Fixed-size Python container:
-    # each entry itself contains Dr.Jit arrays
-    vertices: list[Sample] = field(default_factory=list)
-
-    # Number of valid vertices for every JIT lane
-    length: mi.UInt32 = field(default_factory=lambda: mi.UInt32(0))
-
-    # PT/GI shift metadata
-    reconnection_index: mi.UInt32 = field(default_factory=lambda: mi.UInt32(0))
-
-    @staticmethod
-    def empty(width):
-        return Path(
-            vertices=[Sample.make_empty_sample(width) for _ in range(MAX_PATH_LENGTH)],
-            length=dr.zeros(mi.UInt32, width),
-            reconnection_index=dr.zeros(mi.UInt32, width),
-        )
-
-def select_path(mask: mi.Mask, a: Path, b: Path) -> Path:
-    return Path(
-        vertices=[select_sample(mask, a.vertices[i], b.vertices[i]) for i in range(MAX_PATH_LENGTH)],
-        length=dr.select(mask, a.length, b.length),
-        reconnection_index=dr.select(mask, a.reconnection_index, b.reconnection_index)
-    )
 
 @dataclass
 class Reservoir:
     # selected sample
-    select: Path = field(default_factory = Path)
+    select: Sample = field(default_factory=Sample)
 
     # sum of all reservoir weights
     w_sum: mi.Float = field(default_factory=lambda: mi.Float(0.0))
@@ -105,14 +81,14 @@ class Reservoir:
     @staticmethod
     def empty(width):
         return Reservoir(
-            select=Path.empty(width),
+            select=Sample.make_empty_sample(width),
             w_sum=dr.zeros(mi.Float, width),
             M=dr.zeros(mi.Float, width),
             W=dr.zeros(mi.Float, width)
         )
 
     # Adding a sample to the reservoir
-    def add_path(self, sample: Path, reservoir_weight: mi.Float, rnd1D: mi.Float, active: mi.Mask):
+    def add_sample(self, sample: Sample, reservoir_weight: mi.Float, rnd1D: mi.Float, active: mi.Mask):
 
         # Get the mask for currently active Jit lanes with valid weights
         active_path = active & (reservoir_weight > 0)
@@ -127,7 +103,7 @@ class Reservoir:
         replace = active_path & (rnd1D < reservoir_weight/self.w_sum)
 
         # Replace the selected Sample with the new Sample
-        self.select = select_path(replace, sample, self.select)
+        self.select = dr.select(replace, sample, self.select)
 
     # Final computation of the reservoir, must be called before merging reservoirs or getting the selected and W arguments
     def finalize(self, p_hat_selected: mi.Float, active: mi.Mask):
@@ -159,7 +135,7 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
         reservoir_weight = p_hat * r.W * r.M
 
         # Add this candidate in the new reservoir
-        s.add_path(r.select, reservoir_weight, sampler.next_1d(active_r), active_r)
+        s.add_sample(r.select, reservoir_weight, sampler.next_1d(active_r), active_r)
 
         # Add the nb of samples of this reservoir to our combined reservoir nb
         M_total += dr.select(active_r, r.M, 0.0)
@@ -179,50 +155,42 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
 
 def gather_sample(sample: Sample, index: mi.UInt32, active: mi.Mask) -> Sample:
     return Sample(
-        surface_position=dr.gather(mi.Point3f, sample.surface_position, index, active),
-        surface_normal=dr.gather(mi.Normal3f, sample.surface_normal, index, active),
-        direction_sample=dr.gather(mi.DirectionSample3f, sample.direction_sample, index, active),
+        x1=dr.gather(mi.Point3f, sample.x1, index, active),
+        x1_n=dr.gather(mi.Normal3f, sample.x1_n, index, active),
+        x2=dr.gather(mi.Point3f, sample.x2, index, active),
+        x2_n=dr.gather(mi.Normal3f, sample.x2_n, index, active),
         pdf=dr.gather(mi.Float, sample.pdf, index, active),
-        radiance=dr.gather(mi.Spectrum, sample.radiance, index, active)
-    )
-
-def gather_path(path: Path, index: mi.UInt32, active: mi.Mask) -> Path:
-    return Path(
-        vertices=[gather_sample(path.vertices[i], index, active) for i in range(MAX_PATH_LENGTH)],
-        length=dr.gather(mi.UInt32, path.length, index, active),
-        reconnection_index=dr.gather(mi.UInt32, path.reconnection_index, index, active)
+        radiance=dr.gather(mi.Spectrum, sample.radiance, index, active),
+        random_x1=dr.gather(mi.Vector3f, sample.random_x1, index, active),
+        random_x2=dr.gather(mi.Vector3f, sample.random_x2, index, active)
     )
 
 # Gathers the reservoirs associated with the indexes
 def gather_reservoir(r_set: Reservoir, index: mi.UInt32, active: mi.Mask) -> Reservoir:
-    path_set = gather_path(r_set.select, index, active)
+    sample_set = gather_sample(r_set.select, index, active)
     w_sum_set = dr.gather(dtype=mi.Float, source=r_set.w_sum, index=index, active=active)
     M_set = dr.gather(dtype=mi.Float, source=r_set.M, index=index, active=active)
     W_set = dr.gather(dtype=mi.Float, source=r_set.W, index=index, active=active)
 
-    return Reservoir(select=path_set, w_sum=w_sum_set, W=W_set, M=M_set)
+    return Reservoir(select=sample_set, w_sum=w_sum_set, W=W_set, M=M_set)
 
 
 def scatter_sample(target: Sample, source: Sample, index: mi.UInt32, active: mi.Mask):
-    dr.scatter(target.surface_position, source.surface_position, index, active=active)
-    dr.scatter(target.surface_normal, source.surface_normal, index, active=active)
-    dr.scatter(target.direction_sample, source.direction_sample, index, active=active)
+    dr.scatter(target.x1, source.x1, index, active=active)
+    dr.scatter(target.x1_n, source.x1_n, index, active=active)
+    dr.scatter(target.x2, source.x2, index, active=active)
+    dr.scatter(target.x2_n, source.x2_n, index, active=active)
     dr.scatter(target.pdf, source.pdf, index, active=active)
     dr.scatter(target.radiance, source.radiance, index, active=active)
-
-def scatter_path(target: Path, source: Path, index: mi.UInt32, active: mi.Mask):
-    for i in range(MAX_PATH_LENGTH):
-        scatter_sample(target.vertices[i], source.vertices[i], index, active)
-
-    dr.scatter(target.length, source.length, index, active=active)
-    dr.scatter(target.reconnection_index, source.reconnection_index, index, active=active)
+    dr.scatter(target.random_x1, source.random_x1, index, active=active)
+    dr.scatter(target.random_x2, source.random_x2, index, active=active)
 
 
 # Store resulting reservoir for next frame
 # dr.scatter() modifies its target in place
 def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32, active: mi.Mask):
 
-    scatter_path(previous.select, current.select, index, active)
+    scatter_sample(previous.select, current.select, index, active)
     dr.scatter(previous.w_sum, current.w_sum, index, active=active)
     dr.scatter(previous.M, current.M, index, active=active)
     dr.scatter(previous.W, current.W, index, active=active)
@@ -237,34 +205,23 @@ Note:
 This function follows the Mitsuba convention of returning p_hat(x) / pdf(x),
 so it does not return the pure ReSTIR target function p_hat.
 """
-def eval_p_hat_spectrum(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Path, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Spectrum:
+def eval_p_hat_spectrum(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Spectrum:
 
-    secondary = candidate.vertices[1]
-    active_p = (active & (candidate.length >= 2) & (secondary.pdf > 0.0))
+    # Check if the candidate is valid for the current sample space
+    valid_candidate = active & (candidate.pdf > 0)
 
-    # Reconnect current x1 to stored x2
-    delta = secondary.surface_position - current_si.p
-    dist = dr.norm(delta)
+    # Compute the bsdf from the current x1 to the candidate x2
+    wo = candidate.x2 - current_si.p
+    bsdf_val = bsdf.eval(bsdf_ctx, current_si, wo, valid_candidate)
+    emitter_val = candidate.radiance
 
-    active_p &= dist > 0.0
-
-    safe_dist = dr.select(active_p, dist, 1.0)
-    d = delta / safe_dist
-
-    # Evaluate current x1 BSDF toward x2
-    wo = current_si.to_local(d)
-    bsdf_val, _ = bsdf.eval_pdf(bsdf_ctx, current_si, wo, active_p)
-    bsdf_val = current_si.to_world_mueller(bsdf_val, -wo, current_si.wi)
-
-    # Stored indirect radiance coming from x2
-    Li = secondary.radiance
-    p_hat_spectrum = bsdf_val * Li
-    safe_pdf = dr.select(active_p, secondary.pdf, 1.0)
-    result = dr.select(active_p, p_hat_spectrum / safe_pdf, 0.)
+    p_hat_spectrum = bsdf_val * emitter_val
+    safe_pdf = dr.select(valid_candidate, candidate.pdf, 1.0)
+    result = dr.select(valid_candidate, p_hat_spectrum / safe_pdf, 0.)
     
-    return dr.select(active_p, result, 0.0)
-
-def eval_p_hat(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Path, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Float:
+    return result
+    
+def eval_p_hat(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Float:
     # Evaluate p_hat_spectrum to get the spectrum
     p_hat_spectrum = eval_p_hat_spectrum(scene, current_si, candidate, bsdf, bsdf_ctx, sampler, active)
 
@@ -344,3 +301,125 @@ def validate_surface_similarity(current_position: mi.Point3f, current_normal: mi
 
     return (active & (position_error < POSITION_THRESHOLD) & (normal_similarity > NORMAL_THRESHOLD))
 
+
+def reconnection_jacobian(source_x1: mi.Point3f, target_x1: mi.Point3f, x2: mi.Point3f, n2: mi.Normal3f, active: mi.Mask) -> mi.Float:
+
+    # Vectors from x2 toward the source and target primary vertices
+    delta_source = source_x1 - x2
+    delta_target = target_x1 - x2
+
+    # Squared connection lengths
+    dist2_source = dr.squared_norm(delta_source)
+    dist2_target = dr.squared_norm(delta_target)
+
+    valid = (active & (dist2_source > 0.0) & (dist2_target > 0.0))
+
+    # Safe normalization
+    safe_dist_source = dr.sqrt(dr.select(valid, dist2_source, 1.0))
+
+    safe_dist_target = dr.sqrt(dr.select(valid, dist2_target, 1.0))
+
+    dir_source = delta_source / safe_dist_source
+    dir_target = delta_target / safe_dist_target
+
+    # Cosines at x2
+    cos_source = dr.abs(dr.dot(n2, dir_source))
+    cos_target = dr.abs(dr.dot(n2, dir_target))
+    valid &= cos_source > 0.0
+    valid &= cos_target > 0.0
+
+    safe_cos_source = dr.select(valid, cos_source, 1.0)
+    safe_dist2_target = dr.select(valid, dist2_target, 1.0)
+
+    J = (cos_target / safe_cos_source * dist2_source / safe_dist2_target)
+
+    return dr.select(valid, J, 0.0)
+
+
+def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2: mi.RayDifferential3f, sampler: mi.Sampler, first_random: mi.Vector3f, active: mi.Mask, max_depth: int = 5) -> mi.Spectrum:
+
+    # Accumulated outgoing radiance from x2
+    L = dr.zeros(mi.Spectrum, dr.width(x2.p))
+
+    # Path throughput from x2 to the current vertex
+    throughput = mi.Spectrum(1.0)
+
+    # Current path state
+    si = x2
+    ray = ray_x2
+    active_path = active & x2.is_valid()
+
+    bsdf_ctx = mi.BSDFContext()
+
+    for depth in range(max_depth):
+
+        # ------------------------------------------------------
+        # 1. Accumulate emission at the current vertex
+        # ------------------------------------------------------
+        emitter = si.emitter(scene, active_path)
+        Le = emitter.eval(si, active_path)
+
+        hit_emitter = active_path & dr.any(Le != 0, axis=0)
+
+        L += dr.select(
+            hit_emitter,
+            throughput * Le,
+            0.0
+        )
+
+        # In this simple BSDF-only estimator, stop once a light is hit
+        active_path &= ~hit_emitter
+
+        # ------------------------------------------------------
+        # 2. Sample the BSDF
+        # ------------------------------------------------------
+        bsdf = si.bsdf(ray)
+
+        # Replay the stored random numbers for the first event at x2
+        if depth == 0:
+            sample1 = first_random.x
+            sample2 = mi.Point2f(
+                first_random.y,
+                first_random.z
+            )
+        else:
+            sample1 = sampler.next_1d(active_path)
+            sample2 = sampler.next_2d(active_path)
+
+        bs, bsdf_weight = bsdf.sample(
+            bsdf_ctx,
+            si,
+            sample1,
+            sample2,
+            active_path
+        )
+
+        active_path &= bs.pdf > 0.0
+
+        # Mitsuba BSDF sampling weight contains f * cos / pdf
+        bsdf_weight = si.to_world_mueller(
+            bsdf_weight,
+            -bs.wo,
+            si.wi
+        )
+
+        # Update path throughput
+        throughput *= bsdf_weight
+
+        # ------------------------------------------------------
+        # 3. Trace one continuation ray
+        # ------------------------------------------------------
+        wo_world = si.to_world(bs.wo)
+
+        ray = si.spawn_ray(wo_world)
+
+        si = scene.ray_intersect(
+            ray,
+            ray_flags=mi.RayFlags.All,
+            coherent=False,
+            active=active_path
+        )
+
+        active_path &= si.is_valid()
+
+    return L

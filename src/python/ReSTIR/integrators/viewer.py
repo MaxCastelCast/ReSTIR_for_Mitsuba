@@ -21,6 +21,7 @@ from nanogui.interop import FrameStream, drjit_sink
 import temp_reuse
 import ris_di
 import restir_di
+import restir_gi
 
 VARIANTS = ("cuda_ad_rgb", "metal_ad_rgb", "llvm_ad_rgb")
 
@@ -40,7 +41,8 @@ INTEGRATORS = (
     IntegratorChoice("Path tracer", "path"),
     IntegratorChoice("RIS DI", "direct_ris"),
     IntegratorChoice("Temporal Reuse", "temp_reuse"),
-    IntegratorChoice("ReSTIR DI", "restir_di")
+    IntegratorChoice("ReSTIR DI", "restir_di"),
+    IntegratorChoice("ReSTIR GI", "restir_gi")
 )
 
 
@@ -698,7 +700,7 @@ class MitsubaRenderer:
 
 
         # Initialize ReSTIR temporal state outside dr.freeze
-        if isinstance(self.integrator, restir_di.Restir_Di_Integrator):
+        if isinstance(self.integrator, restir_di.Restir_Di_Integrator) or isinstance(self.integrator, restir_gi.Restir_Gi_Integrator):
             if self.integrator.previous_camera is None:
                 self.integrator.prepare_frame(self.sensor)
 
@@ -714,7 +716,7 @@ class MitsubaRenderer:
         )
 
         # Call Prepare next frame for ReSTIR
-        if isinstance(self.integrator, restir_di.Restir_Di_Integrator):
+        if isinstance(self.integrator, restir_di.Restir_Di_Integrator) or isinstance(self.integrator, restir_gi.Restir_Gi_Integrator):
             self.integrator.prepare_next_frame(self.sensor)
 
         if not denoise:

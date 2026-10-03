@@ -204,13 +204,10 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                         initial_reservoir.M, 
                         initial_reservoir.W, 
                         initial_reservoir.select.pdf, 
-                        initial_reservoir.select.surface_position,
-                        initial_reservoir.select.surface_normal,
-                        initial_reservoir.select.direction_sample.p, 
-                        initial_reservoir.select.direction_sample.d, 
-                        initial_reservoir.select.direction_sample.dist,
-                        initial_reservoir.select.direction_sample.n, 
-                        initial_reservoir.select.direction_sample.uv, 
+                        initial_reservoir.select.x1,
+                        initial_reservoir.select.x1_n,
+                        initial_reservoir.select.x2,
+                        initial_reservoir.select.x2_n,
                         si.p, si.n, si.sh_frame.n, si.wi, si.uv, 
                         valid_ray, direct_emission
                     )
@@ -223,14 +220,13 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                     temporal_reservoir.M,
                     temporal_reservoir.W,
                     temporal_reservoir.select.pdf,
-                    temporal_reservoir.select.surface_position,
-                    temporal_reservoir.select.surface_normal,
-
-                    temporal_reservoir.select.direction_sample.p,
-                    temporal_reservoir.select.direction_sample.d,
-                    temporal_reservoir.select.direction_sample.dist,
-                    temporal_reservoir.select.direction_sample.n,
-                    temporal_reservoir.select.direction_sample.uv,
+                    temporal_reservoir.select.x1,
+                    temporal_reservoir.select.x1_n,
+                    temporal_reservoir.select.x2,
+                    temporal_reservoir.select.x2_n,
+                    temporal_reservoir.select.radiance,
+                    temporal_reservoir.select.random_x1,
+                    temporal_reservoir.select.random_x2,
                 )
 
                 spacial_reservoir = self.sample_spacial_reuse(scene, sampler, ray, si, temporal_reservoir, valid_ray, film_width, film_height, pixel_index)
@@ -241,14 +237,13 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                     spacial_reservoir.M,
                     spacial_reservoir.W,
                     spacial_reservoir.select.pdf,
-                    spacial_reservoir.select.surface_position,
-                    spacial_reservoir.select.surface_normal,
-
-                    spacial_reservoir.select.direction_sample.p,
-                    spacial_reservoir.select.direction_sample.d,
-                    spacial_reservoir.select.direction_sample.dist,
-                    spacial_reservoir.select.direction_sample.n,
-                    spacial_reservoir.select.direction_sample.uv,
+                    spacial_reservoir.select.x1,
+                    spacial_reservoir.select.x1_n,
+                    spacial_reservoir.select.x2,
+                    spacial_reservoir.select.x2_n,
+                    spacial_reservoir.select.radiance,
+                    spacial_reservoir.select.random_x1,
+                    spacial_reservoir.select.random_x2
                 )
 
 
@@ -267,11 +262,13 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                     self.currentGrid.M,
                     self.currentGrid.W,
                     self.currentGrid.select.pdf,
-                    self.currentGrid.select.direction_sample.p,
-                    self.currentGrid.select.direction_sample.d,
-                    self.currentGrid.select.direction_sample.dist,
-                    self.currentGrid.select.direction_sample.n,
-                    self.currentGrid.select.direction_sample.uv,
+                    self.currentGrid.select.x1,
+                    self.currentGrid.select.x1_n,
+                    self.currentGrid.select.x2,
+                    self.currentGrid.select.x2_n,
+                    self.currentGrid.select.radiance,
+                    self.currentGrid.select.random_x1,
+                    self.currentGrid.select.random_x2
                 )
 
                 self.previousGrid, self.currentGrid = (self.currentGrid, self.previousGrid)
@@ -305,156 +302,68 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 
     def sample_initial_reservoir(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.RayDifferential3f, active: mi.Mask = True) -> tuple[Reservoir, mi.SurfaceInteraction3f, mi.Mask, mi.Spectrum]:
-        # Get the current intersection with the scene
-        x1 = scene.ray_intersect(ray, ray_flags = mi.RayFlags.All, coherent = True, active = active)
-
-        # We can perform correct computations only on rays that intersected with the scene
+        x1 = scene.ray_intersect(ray, ray_flags=mi.RayFlags.All, coherent=True, active=active)
         valid_ray = active & x1.is_valid()
-        active_x1 = active & x1.is_valid()
+        active_x1 = valid_ray
 
-        # Add directly visible emission
-        emitter = x1.emitter(scene, active_x1)
-        direct_emission = emitter.eval(x1, active_x1)
+        emitter_x1 = x1.emitter(scene, active_x1)
+        direct_emission = emitter_x1.eval(x1, active_x1)
 
-        # Reservoir
         current_reservoir = Reservoir.empty(dr.width(ray))
 
-        # BSDF at x1
         bsdf_ctx = mi.BSDFContext()
         bsdf_x1 = x1.bsdf(ray)
 
-        # Probability of choosing each lighting technique at x2
-        p_nee = 0.5
-        p_bsdf = 1 - p_nee
 
+        # Generate initial ReSTIR GI candidates
         for _ in range(self.initial_candidates):
 
-            # Light samples to be added for x2
-            light_ds = dr.zeros(mi.DirectionSample3f, dr.width(ray))
+            rD1, rD2, rD3 = sampler.next_1d(active_x1), sampler.next_1d(active_x1), sampler.next_1d(active_x1)
 
-            # Sample a direction from the BSDF at x1
-            bs_1, bsdf_weight_1 = bsdf_x1.sample(bsdf_ctx, x1, sampler.next_1d(active_x1), sampler.next_2d(active_x1), active_x1)
-    
-            # We remove from the valid computations the ones with zero probability of sampling this direction
-            active_x2 = active_x1 & (bs_1.pdf > 0.)
-    
-            # Mitsuba returns the BSDF sampling weight in local coordinates
+            random_x1 = mi.Vector3f(rD1, rD2, rD3)
+
+            bs_1, bsdf_weight_1 = bsdf_x1.sample(bsdf_ctx, x1, rD1, mi.Point2f(rD2, rD3), active_x1)
+
+            active_x2 = (active_x1 & (bs_1.pdf > 0.0))
+
+
+            # Convert BSDF sampling weight to world-space Mueller representation
             bsdf_weight_1 = x1.to_world_mueller(bsdf_weight_1, -bs_1.wo, x1.wi)
-    
-            # Trace a ray in the sampled direction and intersect against the scene
+
             wo_world_1 = x1.to_world(bs_1.wo)
             ray_x2 = x1.spawn_ray(wo_world_1)
+
             x2 = scene.ray_intersect(ray_x2, ray_flags=mi.RayFlags.All, coherent=True, active=active_x2)
             active_x2 &= x2.is_valid()
-    
-            # BSDF at x2
-            bsdf_x2 = x2.bsdf(ray_x2)
 
-            # Radiance represented by this secondary vertex
-            Lo_x2 = dr.zeros(mi.Spectrum, dr.width(ray))
+            rD4, rD5, rD6 = sampler.next_1d(active_x2), sampler.next_1d(active_x2), sampler.next_1d(active_x2)
 
-            # Randomly choose how to shade x2 :
-            strategy_sample = sampler.next_1d(active_x2)
-            use_nee = active_x2 & (strategy_sample < p_nee)
-            use_bsdf = active_x2 & ~use_nee
+            random_x2 = mi.Vector3f(rD4, rD5, rD6)
 
-            ## EMITTER SAMPLE CASE ##
+            Lo_x2 = trace_radiance_from_x2(scene=scene, x2=x2, ray_x2=ray_x2, sampler=sampler, first_random=random_x2, active=active_x2)
 
-            # Sample an emitter point in the scene, we set visibility check to false because our target function is p_hat = BRDF(x) * L_e(x) * G(x)
-            # ds : direction sample
-            # emitter_weight : the pixel value at the emitter divided by the emitter sampling pdf : L_e(y) / pdf_emitter(y)
-            ds_nee, emitter_weight = scene.sample_emitter_direction(x2, sampler.next_2d(use_nee), False, use_nee)
+            candidate = Sample(x1=x1.p, x1_n=x1.n, x2=x2.p, x2_n=x2.n, pdf=bs_1.pdf, radiance=Lo_x2, random_x1=random_x1, random_x2=random_x2)
 
-            # We remove from the valid computations the ones with zero probability of sampling this emitter point
-            active_e = use_nee & (ds_nee.pdf > 0.)
-
-            ## For the MIS weights, we need also need the probability of sampling that same point with BSDF sampling 
-            wo = x2.to_local(ds_nee.d) 
-
-            # Evaluate the BSDF at the intersection point for the sampled direction
-            bsdf_val, bsdf_pdf = bsdf_x2.eval_pdf(bsdf_ctx, x2, wo, active_e)
-
-            # Convert back to world coordinates
-            bsdf_val = x2.to_world_mueller(bsdf_val, -wo, x2.wi)
-
-            # Compute the MIS weight for the area sampling case, BSDF sampling cannot sample that direction from a delta surface (because it is impossible that it will match the perfect reflection direction, so p_bsdf(x) = 0)
-            # We have the BSDF sampling pdf to 0 for delta surfaces and therefore mis_area = p_emitter^2 / (p_emitter^2 + 0^2) = 1
-            emitter_pdf = ds_nee.pdf
-            mis_emitter = dr.select(ds_nee.delta, 1., mis_weight(emitter_pdf, bsdf_pdf, p_nee, p_bsdf))
-
-            # emitter_weight already contains 1 / emitter_pdf
-            contribution = bsdf_val * emitter_weight
-            contribution *= mis_emitter / p_nee
-
-            # Accumulate the path contribution
-            Lo_x2 += dr.select(active_e, contribution, 0.0)
-            light_ds = dr.select(active_e, ds_nee, light_ds)
-
-            ## BSDF SAMPLE CASE ##
-
-            # Sample a bsdf point in the scene from the intersection point si
-            # bs : bsdf sample obtained (not directly a direction sample!)
-            # bsdf_weight : the bsdf evaluation divided by the probability of sampling that value : bs_val = BSDF(x) = p_bsdf(x)
-            # /!\ : Those results are returned in local coordinates
-            bs_2, bsdf_weight_2 = bsdf_x2.sample(bsdf_ctx, x2, sampler.next_1d(use_bsdf), sampler.next_2d(use_bsdf), use_bsdf)
-
-            # We remove from the valid computations the Jit lines that have a zero probability of sampling this direction
-            active_b = use_bsdf & (bs_2.pdf > 0.) 
-
-            # Convert from local BSDF coordinates to world coordinates and apply Mueller matrix transformation
-            bsdf_weight_2 = x2.to_world_mueller(bsdf_weight_2, -bs_2.wo, x2.wi)
-
-            # Trace the ray in the sampled direction and intersect against the scene
-            wo_world_2 = x2.to_world(bs_2.wo)
-            ray_light = x2.spawn_ray(wo_world_2)
-            x3 = scene.ray_intersect(ray_light, active_b)
-
-            active_b &= x3.is_valid()
-
-            # Check if the ray hit an emitter
-            emitter = x3.emitter(scene, active_b)
-            emitter_val = emitter.eval(x3, active_b)
-            active_b &= dr.any(emitter_val != 0, axis=0)
-
-            # Construct direction sample x2 -> emitter hit x3
-            ds_bsdf = mi.DirectionSample3f(scene, x3, x2)
-
-            # PDF of producing the same direction using emitter sampling
-            emitter_pdf = scene.pdf_emitter_direction(x2, ds_bsdf, active_b)
-
-            # We want to set the emitter contribution pdf to 0 for delta BSDFs, since they cannot be sampled by the emitter sampling technique
-            delta = mi.has_flag(bs_2.sampled_type, mi.BSDFFlags.Delta)
-            emitter_pdf = dr.select(delta, 0., emitter_pdf)
-
-            # Compute the MIS weight for the BSDF sampling case
-            mis_bsdf = mis_weight(bs_2.pdf, emitter_pdf, p_bsdf, p_nee)
-
-            contribution = bsdf_weight_2 * emitter_val
-            contribution *= mis_bsdf / p_bsdf
-
-            Lo_x2 += dr.select(active_b, contribution, 0.0)
-
-            light_ds = dr.select(active_b, ds_bsdf, light_ds)
-
-            ## ADD THE SAMPLES TO THE RESERVOIR ##
-
-            # Contruct the GI candidate path from x1 to x2
-            sample_x1 = Sample(surface_position=x1.p, surface_normal=x1.n)
-            sample_x2 = Sample(surface_position=x2.p, surface_normal=x2.n, direction_sample=light_ds, pdf=bs_1.pdf, radiance=Lo_x2)
-            candidate = Path(vertices=[sample_x1, sample_x2], length=dr.select(active_x2, mi.UInt32(2), mi.UInt32(0)), reconnection_index=dr.select(active_x2, mi.UInt32(1), mi.UInt32(0)))
-
-            # Compute the Monte Carlo contribution of a GI sample
             candidate_weight_spectrum = bsdf_weight_1 * Lo_x2
             reservoir_weight = mi.luminance(mi.unpolarized_spectrum(candidate_weight_spectrum), x1.wavelengths, active_x2)
+            current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=sampler.next_1d(active_x2), active=active_x2)
 
-            current_reservoir.add_path(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=sampler.next_1d(active_x2), active=active_x2)
 
-        # Important:
-        # Evaluate the selected secondary path relative to the current PRIMARY
-        # interaction x1, not x2.
-        p_hat_current = eval_p_hat(scene, x1, current_reservoir.select, bsdf_x1, bsdf_ctx, sampler, active_x1)
+        p_hat_current = eval_p_hat(
+            scene,
+            x1,
+            current_reservoir.select,
+            bsdf_x1,
+            bsdf_ctx,
+            sampler,
+            active_x1
+        )
 
-        current_reservoir.finalize(p_hat_current, active_x1)
+        current_reservoir.finalize(
+            p_hat_current,
+            active_x1
+        )
+
 
         return (current_reservoir, x1, valid_ray, direct_emission)
 
@@ -477,7 +386,9 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         # /!\ We have to first check if we can use temporal reuse with geometry similarity tests 
         # Use geometric check to verify if the temporal sample is useful for our current geometry
-        valid_history = validate_surface_similarity(si.p, si.n, previous_reservoir.select.surface_position, previous_reservoir.select.surface_normal, valid_reprojection)
+        x1_surface_pos = previous_reservoir.select.x1
+        x1_surface_normal = previous_reservoir.select.x1_n
+        valid_history = validate_surface_similarity(si.p, si.n, x1_surface_pos, x1_surface_normal, valid_reprojection)
 
         # 2) Merge this reservoir with the current reservoir
         temporal_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , (initial_reservoir, active), (previous_reservoir, valid_history))
@@ -502,7 +413,7 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
             # /!\ We have to first check if we can use spacial reuse with geometry similarity tests 
             # Use geometric check to verify if the temporal sample is useful for our current geometry
-            valid_neighborhood = validate_surface_similarity(si.p, si.n, neighbor_reservoir.select.surface_position, neighbor_reservoir.select.surface_normal, valid_neighbors)
+            valid_neighborhood = validate_surface_similarity(si.p, si.n, neighbor_reservoir.select.x1, neighbor_reservoir.select.x1_n, valid_neighbors)
 
             # Append the reservoir to our list of reservoirs
             reservoirs.append((neighbor_reservoir, valid_neighborhood))
@@ -532,7 +443,7 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         
         # Trace a ray from the original intersection point to the selected candidate point and check for visibility
-        shadow_ray = si.spawn_ray_to(selected_candidate.direction_sample.p)
+        shadow_ray = si.spawn_ray_to(selected_candidate.x2)
 
         # Check if we have an occlusion
         occluded = scene.ray_test(shadow_ray, active)
@@ -556,6 +467,6 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 # Register the integrator as a Mitsuba plugin
 mi.register_integrator(
-    "restir_di",
-    lambda props: Restir_Di_Integrator(props)
+    "restir_gi",
+    lambda props: Restir_Gi_Integrator(props)
 )
