@@ -314,6 +314,26 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
         bsdf_ctx = mi.BSDFContext()
         bsdf_x1 = x1.bsdf(ray)
 
+        ## NEE x1 Case ##
+        # Sample a point/direction on a light
+        ds_nee, emitter_weight = scene.sample_emitter_direction(x1, sampler.next_2d(active_x1), True, active_x1)
+
+        active_nee = (active_x1 & (ds_nee.pdf > 0.0))
+
+        # Direction toward sampled light in local BSDF frame
+        wo_nee = x1.to_local(ds_nee.d)
+
+        # Evaluate BSDF and its PDF for this same direction
+        bsdf_val_nee, bsdf_pdf_nee = bsdf_x1.eval_pdf(bsdf_ctx, x1, wo_nee, active_nee)
+        bsdf_val_nee = x1.to_world_mueller(bsdf_val_nee, -wo_nee, x1.wi)
+
+        # If the light sample is delta, BSDF sampling cannot produce
+        # the same point/direction in the usual continuous sense.
+        mis_nee = dr.select(ds_nee.delta, 1.0, mis_weight(ds_nee.pdf, bsdf_pdf_nee, 1.0, 1.0))
+
+        nee_contribution_x1 = (bsdf_val_nee * emitter_weight * mis_nee)
+        direct_nee = dr.select(active_nee, nee_contribution_x1, 0.0)
+        
 
         # Generate initial ReSTIR GI candidates
         for _ in range(self.initial_candidates):
@@ -326,7 +346,6 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
             active_x2 = (active_x1 & (bs_1.pdf > 0.0))
 
-
             # Convert BSDF sampling weight to world-space Mueller representation
             bsdf_weight_1 = x1.to_world_mueller(bsdf_weight_1, -bs_1.wo, x1.wi)
 
@@ -337,11 +356,18 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
             active_x2 &= x2.is_valid()
 
             rD4, rD5, rD6 = sampler.next_1d(active_x2), sampler.next_1d(active_x2), sampler.next_1d(active_x2)
-
             random_x2 = mi.Vector3f(rD4, rD5, rD6)
 
+            ## BSDF x1 Case ##
             Lo_x2 = trace_radiance_from_x2(scene=scene, x2=x2, ray_x2=ray_x2, sampler=sampler, first_random=random_x2, active=active_x2)
 
+            # bsdf contribution at x1
+            bsdf_contribution_x1 = bsdf_weight_1 * Lo_x2
+
+            # Compute total contribution at x1 (NEE + BSDF)
+            total_contribution_x1 = direct_nee + bsdf_contribution_x1
+
+            # Construct a candidate sample for the reservoir
             candidate = Sample(x1=x1.p, x1_n=x1.n, x2=x2.p, x2_n=x2.n, pdf=bs_1.pdf, radiance=Lo_x2, random_x1=random_x1, random_x2=random_x2)
 
             candidate_weight_spectrum = bsdf_weight_1 * Lo_x2
@@ -349,23 +375,12 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
             current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=sampler.next_1d(active_x2), active=active_x2)
 
 
-        p_hat_current = eval_p_hat(
-            scene,
-            x1,
-            current_reservoir.select,
-            bsdf_x1,
-            bsdf_ctx,
-            sampler,
-            active_x1
-        )
+        p_hat_current = eval_p_hat(scene, x1, current_reservoir.select, bsdf_x1, bsdf_ctx, sampler, active_x1)
+        current_reservoir.finalize(p_hat_current, active_x1)
 
-        current_reservoir.finalize(
-            p_hat_current,
-            active_x1
-        )
+        direct_lighting = direct_emission + direct_nee
 
-
-        return (current_reservoir, x1, valid_ray, direct_emission)
+        return (current_reservoir, x1, valid_ray, direct_lighting)
 
 
     def sample_temporal_reuse(self, scene: mi.Scene, sensor: mi.Sensor, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, initial_reservoir: Reservoir, valid_ray: mi.Mask, film_width: int, film_height: int, pixel_index: mi.UInt32) -> Reservoir:

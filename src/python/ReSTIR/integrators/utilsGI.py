@@ -335,53 +335,140 @@ def reconnection_jacobian(source_x1: mi.Point3f, target_x1: mi.Point3f, x2: mi.P
 
     return dr.select(valid, J, 0.0)
 
-
 def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2: mi.RayDifferential3f, sampler: mi.Sampler, first_random: mi.Vector3f, active: mi.Mask, max_depth: int = 5) -> mi.Spectrum:
 
-    # Accumulated outgoing radiance from x2
     L = dr.zeros(mi.Spectrum, dr.width(x2.p))
-
-    # Path throughput from x2 to the current vertex
     throughput = mi.Spectrum(1.0)
 
-    # Current path state
     si = x2
     ray = ray_x2
     active_path = active & x2.is_valid()
 
     bsdf_ctx = mi.BSDFContext()
 
+    # State needed for MIS when BSDF continuation hits an emitter
+    prev_si = x2
+    prev_bsdf_pdf = dr.zeros(mi.Float, dr.width(x2.p))
+    prev_delta = dr.zeros(mi.Bool, dr.width(x2.p))
+    have_prev_bsdf = dr.zeros(mi.Bool, dr.width(x2.p))
+
     for depth in range(max_depth):
 
-        # ------------------------------------------------------
-        # 1. Accumulate emission at the current vertex
-        # ------------------------------------------------------
+        # ------------------------------------------------------------
+        # 1. BSDF-path emitter hit
+        # ------------------------------------------------------------
+
+        # Current BSDF at this path vertex
+        bsdf = si.bsdf(ray)
+
         emitter = si.emitter(scene, active_path)
         Le = emitter.eval(si, active_path)
 
-        hit_emitter = active_path & dr.any(Le != 0, axis=0)
+        hit_emitter = (active_path & dr.any(Le != 0, axis=0))
+
+        # Default weight:
+        # - 1 at x2 itself
+        # - 1 after delta events
+        mis_bsdf_hit = mi.Float(1.0)
+
+        active_mis = (hit_emitter & have_prev_bsdf & ~prev_delta)
+
+        ds_hit = mi.DirectionSample3f(scene, si, prev_si)
+
+        light_pdf_hit = scene.pdf_emitter_direction(
+            prev_si,
+            ds_hit,
+            active_mis
+        )
+
+        mis_bsdf_hit = dr.select(
+            active_mis,
+            mis_weight(
+                prev_bsdf_pdf,
+                light_pdf_hit,
+                1.0,
+                1.0
+            ),
+            1.0
+        )
 
         L += dr.select(
             hit_emitter,
-            throughput * Le,
+            throughput * Le * mis_bsdf_hit,
             0.0
         )
 
-        # In this simple BSDF-only estimator, stop once a light is hit
+        # In this simple implementation, terminate once an emitter is reached
         active_path &= ~hit_emitter
 
-        # ------------------------------------------------------
-        # 2. Sample the BSDF
-        # ------------------------------------------------------
-        bsdf = si.bsdf(ray)
+        # ------------------------------------------------------------
+        # 2. NEXT EVENT ESTIMATION
+        # ------------------------------------------------------------
 
-        # Replay the stored random numbers for the first event at x2
+        # Sample a point/direction on a light
+        ds_nee, emitter_weight = scene.sample_emitter_direction(
+            si,
+            sampler.next_2d(active_path),
+            True,
+            active_path
+        )
+
+        active_nee = (
+            active_path
+            & (ds_nee.pdf > 0.0)
+        )
+
+        # Direction toward sampled light in local BSDF frame
+        wo_nee = si.to_local(ds_nee.d)
+
+        # Evaluate BSDF and its PDF for this same direction
+        bsdf_val_nee, bsdf_pdf_nee = bsdf.eval_pdf(
+            bsdf_ctx,
+            si,
+            wo_nee,
+            active_nee
+        )
+
+        bsdf_val_nee = si.to_world_mueller(
+            bsdf_val_nee,
+            -wo_nee,
+            si.wi
+        )
+
+        # If the light sample is delta, BSDF sampling cannot produce
+        # the same point/direction in the usual continuous sense.
+        mis_nee = dr.select(
+            ds_nee.delta,
+            1.0,
+            mis_weight(
+                ds_nee.pdf,
+                bsdf_pdf_nee,
+                1.0,
+                1.0
+            )
+        )
+
+        # emitter_weight = Le / p_light
+        nee_contribution = (
+            throughput
+            * bsdf_val_nee
+            * emitter_weight
+            * mis_nee
+        )
+
+        L += dr.select(
+            active_nee,
+            nee_contribution,
+            0.0
+        )
+
+        # ------------------------------------------------------------
+        # 3. BSDF CONTINUATION
+        # ------------------------------------------------------------
+
         if depth == 0:
             sample1 = first_random.x
-            sample2 = mi.Point2f(
-                first_random.y,
-                first_random.z
-            )
+            sample2 = mi.Point2f(first_random.y, first_random.z)
         else:
             sample1 = sampler.next_1d(active_path)
             sample2 = sampler.next_2d(active_path)
@@ -394,32 +481,42 @@ def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2:
             active_path
         )
 
-        active_path &= bs.pdf > 0.0
+        active_bsdf = (
+            active_path
+            & (bs.pdf > 0.0)
+        )
 
-        # Mitsuba BSDF sampling weight contains f * cos / pdf
         bsdf_weight = si.to_world_mueller(
             bsdf_weight,
             -bs.wo,
             si.wi
         )
 
-        # Update path throughput
+        # Save MIS information BEFORE overwriting si
+        prev_si = si
+        prev_bsdf_pdf = bs.pdf
+        prev_delta = mi.has_flag(
+            bs.sampled_type,
+            mi.BSDFFlags.Delta
+        )
+        have_prev_bsdf = active_bsdf
+
         throughput *= bsdf_weight
 
-        # ------------------------------------------------------
-        # 3. Trace one continuation ray
-        # ------------------------------------------------------
+        # Continue path
         wo_world = si.to_world(bs.wo)
-
         ray = si.spawn_ray(wo_world)
 
         si = scene.ray_intersect(
             ray,
             ray_flags=mi.RayFlags.All,
             coherent=False,
-            active=active_path
+            active=active_bsdf
         )
 
-        active_path &= si.is_valid()
+        active_path = (
+            active_bsdf
+            & si.is_valid()
+        )
 
     return L
