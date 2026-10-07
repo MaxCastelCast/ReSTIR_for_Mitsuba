@@ -361,21 +361,19 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
             ## BSDF x1 Case ##
             Lo_x2 = trace_radiance_from_x2(scene=scene, x2=x2, ray_x2=ray_x2, sampler=sampler, first_random=random_x2, active=active_x2)
 
-            # bsdf contribution at x1
-            bsdf_contribution_x1 = bsdf_weight_1 * Lo_x2
-
-            # Compute total contribution at x1 (NEE + BSDF)
-            total_contribution_x1 = direct_nee + bsdf_contribution_x1
-
+        
             # Construct a candidate sample for the reservoir
             candidate = Sample(x1=x1.p, x1_n=x1.n, x2=x2.p, x2_n=x2.n, pdf=bs_1.pdf, radiance=Lo_x2, random_x1=random_x1, random_x2=random_x2)
 
+            # bsdf contribution at x1
             candidate_weight_spectrum = bsdf_weight_1 * Lo_x2
             reservoir_weight = mi.luminance(mi.unpolarized_spectrum(candidate_weight_spectrum), x1.wavelengths, active_x2)
+
+
             current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=sampler.next_1d(active_x2), active=active_x2)
 
 
-        p_hat_current = eval_p_hat(scene, x1, current_reservoir.select, bsdf_x1, bsdf_ctx, sampler, active_x1)
+        p_hat_current = eval_p_hat_normalized(scene, x1, current_reservoir.select, bsdf_x1, bsdf_ctx, sampler, active_x1)
         current_reservoir.finalize(p_hat_current, active_x1)
 
         direct_lighting = direct_emission + direct_nee
@@ -406,7 +404,7 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
         valid_history = validate_surface_similarity(si.p, si.n, x1_surface_pos, x1_surface_normal, valid_reprojection)
 
         # 2) Merge this reservoir with the current reservoir
-        temporal_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active , (initial_reservoir, active), (previous_reservoir, valid_history))
+        temporal_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, False, active , (initial_reservoir, active), (previous_reservoir, valid_history))
 
         return temporal_reservoir
 
@@ -435,7 +433,7 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 
         # 2) Merge all the neighbor reservoirs with the current reservoir
-        spacial_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, active, *reservoirs)
+        spacial_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, True, active, *reservoirs)
 
         return spacial_reservoir
 
@@ -453,8 +451,8 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
         selected_candidate = reservoir.select
 
         # To get the integral estimator, we need to compute I = f(X) * W_X
-        p_hat_X_spectrum = eval_p_hat_spectrum(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
-        p_hat = eval_p_hat(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
+        p_hat_X_spectrum = eval_p_hat_spectrum_normalized(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
+        p_hat = eval_p_hat_normalized(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
 
         
         # Trace a ray from the original intersection point to the selected candidate point and check for visibility

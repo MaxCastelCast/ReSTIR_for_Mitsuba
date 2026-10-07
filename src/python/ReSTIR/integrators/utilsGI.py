@@ -116,7 +116,7 @@ class Reservoir:
 
 
 # Combines an arbitrary number of reservoir and returns the combined reservoirs
-def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask, *reservoirs_mask_pairs : tuple[Reservoir, mi.Mask]) -> Reservoir:
+def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, isSpacialSampling: bool, active: mi.Mask, *reservoirs_mask_pairs : tuple[Reservoir, mi.Mask]) -> Reservoir:
     # Initialize the return reservoire
     width = dr.width(current_si.p)
     s = Reservoir.empty(width)
@@ -129,7 +129,28 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
         active_r = active & valid_r & (r.M > 0)
 
         # We need to evaluate p_hat for the current pixel/surface_interaction so that the candidates can be used for the current context 
-        p_hat = eval_p_hat(scene, current_si, r.select, bsdf, bsdf_ctx, sampler, active_r)
+        p_hat = eval_p_hat_normalized(scene, current_si, r.select, bsdf, bsdf_ctx, sampler, active_r)
+
+        # Divide by the Jacobian if spacial reuse : takes into account the fact that the current reused sample x1 would have been sampled with a different probability in our current path space starting at current pixel
+        if(isSpacialSampling): 
+            # Compute the geometric shift Jacobian
+            J = reconnection_jacobian(r.select.x1, current_si.p, r.select.x2, r.select.x2_n, active_r)
+
+            # The Jacobian must be strictly positive
+            valid_J = active_r & (J > 0.0)
+
+            # Geometric shift of the temporal sample to move it in current space
+            p_hat = dr.select(valid_J, p_hat / J, 0.0)
+
+            # Trace a ray to check for visibility from our current intersection point to the end point of the sample temporal path
+            shadow_ray = current_si.spawn_ray_to(r.select.x2)
+            occluded = scene.ray_test(shadow_ray, valid_J)
+            visible = ~occluded
+
+            # TODO : if we add visibility check here, it isn't p_hat anymore, why we must do a visibility check here ?
+            # This is a tradoff to remove bias
+            # Set the p_hat evalutation to 0 if the sample is occluded 
+            p_hat = dr.select(visible, p_hat, 0.0)
 
         # Compute their reservoir weight which is r_w = r.w_sum * (p_hat_current / p_hat_previous) : determine how this weight is important in this context compared to its original one
         reservoir_weight = p_hat * r.W * r.M
@@ -146,11 +167,37 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
     active_s = active & (s.M > 0)
 
     # Compute the new contribution weight for the selected sample of the combined reservoir
-    p_hat_select = eval_p_hat(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_s)
+    p_hat_select = eval_p_hat_normalized(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_s)
     active_s &= p_hat_select > 0
-    s.finalize(p_hat_select, active_s)
 
-    return s    
+    # Compute the normal W term or the unbiased version, depending on the sampling technique
+    if (isSpacialSampling):
+        # Compute the debias term
+        Z = dr.zeros(mi.Float, width)
+
+        for r, valid_r in reservoirs_mask_pairs:
+
+            active_r = (active & valid_r & (r.M > 0))
+
+            # Evaluate FINAL winner s.select in source domain q_n
+            p_hat_source = eval_p_hat(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_r)
+
+            valid_support = (active_r & (p_hat_source > 0.0))
+
+            Z += dr.select(valid_support, r.M, 0.0)
+
+        valid_final = (active_s & (Z > 0.0) & (p_hat_select > 0.0))
+
+        safe_Z = dr.select(valid_final, Z, 1.0)
+
+        safe_p_hat = dr.select(valid_final, p_hat_select, 1.0)
+
+        s.W = dr.select(valid_final, s.w_sum / (safe_Z * safe_p_hat), 0.0)
+
+        return s
+    else: 
+        s.finalize(p_hat_select, active_s)
+        return s    
 
 
 def gather_sample(sample: Sample, index: mi.UInt32, active: mi.Mask) -> Sample:
@@ -196,16 +243,14 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
     dr.scatter(previous.W, current.W, index, active=active)
 
 
-# Evaluate candidate samples that was from an other sample space in the current sample space
-# (For the GI implementation Only)
 """
-Evaluate the spectral target contribution
+Evaluate candidate samples that was from an other sample space in the current sample space
 
 Note:
 This function follows the Mitsuba convention of returning p_hat(x) / pdf(x),
 so it does not return the pure ReSTIR target function p_hat.
 """
-def eval_p_hat_spectrum(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Spectrum:
+def eval_p_hat_spectrum_normalized(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Spectrum:
 
     # Check if the candidate is valid for the current sample space
     valid_candidate = active & (candidate.pdf > 0)
@@ -221,6 +266,30 @@ def eval_p_hat_spectrum(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, ca
     
     return result
     
+def eval_p_hat_normalized(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Float:
+    # Evaluate p_hat_spectrum to get the spectrum
+    p_hat_spectrum = eval_p_hat_spectrum_normalized(scene, current_si, candidate, bsdf, bsdf_ctx, sampler, active)
+
+    # Get a float value with the luminance of the spectrum
+    p_hat_lum = mi.luminance(mi.unpolarized_spectrum(p_hat_spectrum), current_si.wavelengths, active)
+
+    return p_hat_lum
+
+def eval_p_hat_spectrum(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Spectrum:
+
+    # Check if the candidate is valid for the current sample space
+    valid_candidate = active & (candidate.pdf > 0)
+
+    # Compute the bsdf from the current x1 to the candidate x2
+    wo = candidate.x2 - current_si.p
+    bsdf_val = bsdf.eval(bsdf_ctx, current_si, wo, valid_candidate)
+    emitter_val = candidate.radiance
+
+    p_hat_spectrum = bsdf_val * emitter_val
+    
+    return p_hat_spectrum
+
+
 def eval_p_hat(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Float:
     # Evaluate p_hat_spectrum to get the spectrum
     p_hat_spectrum = eval_p_hat_spectrum(scene, current_si, candidate, bsdf, bsdf_ctx, sampler, active)
@@ -229,6 +298,7 @@ def eval_p_hat(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: 
     p_hat_lum = mi.luminance(mi.unpolarized_spectrum(p_hat_spectrum), current_si.wavelengths, active)
 
     return p_hat_lum
+
 
 # Get the indexes of the previous frame reservoirs that correspond to the current frame pixels
 def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor, current_sensor: mi.Sensor, sampler: mi.Sampler,  film_width: int, film_height: int, pixel_index: mi.UInt32, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
