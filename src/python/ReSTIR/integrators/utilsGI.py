@@ -2,7 +2,6 @@ import mitsuba as mi
 import drjit as dr
 from dataclasses import dataclass, field
 
-mi.set_variant("llvm_ad_rgb")
 
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
@@ -32,6 +31,9 @@ class Sample:
     # The surface normal at x1
     x1_n: mi.Normal3f = field(default_factory=mi.Normal3f)
 
+    # Surface interaction at x1 needed for debiasing
+    x1_si: mi.SurfaceInteraction3f = field(default_factory=mi.SurfaceInteraction3f)
+
     # The position of the vertex x2
     x2: mi.Point3f = field(default_factory=mi.Point3f)
 
@@ -56,6 +58,7 @@ class Sample:
         return Sample(
             x1=dr.zeros(mi.Point3f, width),
             x1_n=dr.zeros(mi.Normal3f, width),
+            x1_si=dr.zeros(mi.SurfaceInteraction3f, width),
             x2=dr.zeros(mi.Point3f, width),
             x2_n=dr.zeros(mi.Normal3f, width),
             pdf=dr.zeros(mi.Float, width),
@@ -105,14 +108,18 @@ class Reservoir:
         # Replace the selected Sample with the new Sample
         self.select = dr.select(replace, sample, self.select)
 
+    # TODO : Modify finalize to make it compatible with biased and unbiased ReSTIR GI
     # Final computation of the reservoir, must be called before merging reservoirs or getting the selected and W arguments
-    def finalize(self, p_hat_selected: mi.Float, active: mi.Mask):
+    def finalize(self, p_hat_selected: mi.Float, active: mi.Mask, debias_term: mi.Float = None):
 
-        active_r = active & (self.M > 0) & (p_hat_selected > 0)
-        safe_M = dr.select(active_r, self.M, 1.0)
+        # Use classic M normalization by default
+        normalization = (self.M if debias_term is None else debias_term)
+
+        active_r = active & (self.M > 0) & (normalization > 0) & (p_hat_selected > 0)
+
+        safe_norm = dr.select(active_r, normalization, 1.0)
         safe_p_hat = dr.select(active_r, p_hat_selected, 1.0)
-
-        self.W = dr.select(active_r, self.w_sum / (safe_M * safe_p_hat) ,0.0)
+        self.W = dr.select(active_r, self.w_sum / (safe_norm * safe_p_hat) ,0.0)
 
 
 # Combines an arbitrary number of reservoir and returns the combined reservoirs
@@ -129,7 +136,7 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
         active_r = active & valid_r & (r.M > 0)
 
         # We need to evaluate p_hat for the current pixel/surface_interaction so that the candidates can be used for the current context 
-        p_hat = eval_p_hat_normalized(scene, current_si, r.select, bsdf, bsdf_ctx, sampler, active_r)
+        p_hat = eval_p_hat(scene, current_si, r.select, bsdf, bsdf_ctx, sampler, active_r)
 
         # Divide by the Jacobian if spacial reuse : takes into account the fact that the current reused sample x1 would have been sampled with a different probability in our current path space starting at current pixel
         if(isSpacialSampling): 
@@ -140,7 +147,7 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
             valid_J = active_r & (J > 0.0)
 
             # Geometric shift of the temporal sample to move it in current space
-            p_hat = dr.select(valid_J, p_hat / J, 0.0)
+            p_hat = dr.select(valid_J, p_hat * J, 0.0)
 
             # Trace a ray to check for visibility from our current intersection point to the end point of the sample temporal path
             shadow_ray = current_si.spawn_ray_to(r.select.x2)
@@ -167,7 +174,7 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
     active_s = active & (s.M > 0)
 
     # Compute the new contribution weight for the selected sample of the combined reservoir
-    p_hat_select = eval_p_hat_normalized(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_s)
+    p_hat_select = eval_p_hat(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_s)
     active_s &= p_hat_select > 0
 
     # Compute the normal W term or the unbiased version, depending on the sampling technique
@@ -179,31 +186,26 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
 
             active_r = (active & valid_r & (r.M > 0))
 
-            # Evaluate FINAL winner s.select in source domain q_n
-            p_hat_source = eval_p_hat(scene, current_si, s.select, bsdf, bsdf_ctx, sampler, active_r)
+            # TODO : add new surface interaction to compute p_hat + visibility check between x1 of reservoir r and the x2 of the selected reservoir
+            x1_r_current_si = r.select.x1_si
+            p_hat_source = eval_p_hat(scene, x1_r_current_si, s.select, bsdf, bsdf_ctx, sampler, active_r)
 
             valid_support = (active_r & (p_hat_source > 0.0))
 
+            # Debias term
             Z += dr.select(valid_support, r.M, 0.0)
 
-        valid_final = (active_s & (Z > 0.0) & (p_hat_select > 0.0))
-
-        safe_Z = dr.select(valid_final, Z, 1.0)
-
-        safe_p_hat = dr.select(valid_final, p_hat_select, 1.0)
-
-        s.W = dr.select(valid_final, s.w_sum / (safe_Z * safe_p_hat), 0.0)
-
-        return s
+        s.finalize(p_hat_select, active_s, Z)
     else: 
         s.finalize(p_hat_select, active_s)
-        return s    
 
+    return s
 
 def gather_sample(sample: Sample, index: mi.UInt32, active: mi.Mask) -> Sample:
     return Sample(
         x1=dr.gather(mi.Point3f, sample.x1, index, active),
         x1_n=dr.gather(mi.Normal3f, sample.x1_n, index, active),
+        x1_si=dr.gather(mi.SurfaceInteraction3f, sample.x1_si, index, active),
         x2=dr.gather(mi.Point3f, sample.x2, index, active),
         x2_n=dr.gather(mi.Normal3f, sample.x2_n, index, active),
         pdf=dr.gather(mi.Float, sample.pdf, index, active),
@@ -225,6 +227,7 @@ def gather_reservoir(r_set: Reservoir, index: mi.UInt32, active: mi.Mask) -> Res
 def scatter_sample(target: Sample, source: Sample, index: mi.UInt32, active: mi.Mask):
     dr.scatter(target.x1, source.x1, index, active=active)
     dr.scatter(target.x1_n, source.x1_n, index, active=active)
+    dr.scatter(target.x1_si, source.x1_si, index, active)
     dr.scatter(target.x2, source.x2, index, active=active)
     dr.scatter(target.x2_n, source.x2_n, index, active=active)
     dr.scatter(target.pdf, source.pdf, index, active=active)
@@ -253,11 +256,13 @@ so it does not return the pure ReSTIR target function p_hat.
 def eval_p_hat_spectrum_normalized(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf: mi.BSDF, bsdf_ctx: mi.BSDFContext, sampler: mi.Sampler, active: mi.Mask) -> mi.Spectrum:
 
     # Check if the candidate is valid for the current sample space
-    valid_candidate = active & (candidate.pdf > 0)
+    valid_candidate = active & (candidate.pdf > 0) 
 
     # Compute the bsdf from the current x1 to the candidate x2
-    wo = candidate.x2 - current_si.p
-    bsdf_val = bsdf.eval(bsdf_ctx, current_si, wo, valid_candidate)
+    wo = dr.normalize(candidate.x2 - current_si.p)
+    wo_local = current_si.to_local(wo)
+
+    bsdf_val = bsdf.eval(bsdf_ctx, current_si, wo_local, valid_candidate)
     emitter_val = candidate.radiance
 
     p_hat_spectrum = bsdf_val * emitter_val
@@ -281,8 +286,10 @@ def eval_p_hat_spectrum(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, ca
     valid_candidate = active & (candidate.pdf > 0)
 
     # Compute the bsdf from the current x1 to the candidate x2
-    wo = candidate.x2 - current_si.p
-    bsdf_val = bsdf.eval(bsdf_ctx, current_si, wo, valid_candidate)
+    wo = dr.normalize(candidate.x2 - current_si.p)
+    wo_local = current_si.to_local(wo)
+
+    bsdf_val = bsdf.eval(bsdf_ctx, current_si, wo_local, valid_candidate)
     emitter_val = candidate.radiance
 
     p_hat_spectrum = bsdf_val * emitter_val
@@ -405,7 +412,7 @@ def reconnection_jacobian(source_x1: mi.Point3f, target_x1: mi.Point3f, x2: mi.P
 
     return dr.select(valid, J, 0.0)
 
-def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2: mi.RayDifferential3f, sampler: mi.Sampler, first_random: mi.Vector3f, active: mi.Mask, max_depth: int = 5) -> mi.Spectrum:
+def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2: mi.RayDifferential3f, sampler: mi.Sampler, first_random: mi.Vector3f, active: mi.Mask, max_depth: int = 1) -> mi.Spectrum:
 
     L = dr.zeros(mi.Spectrum, dr.width(x2.p))
     throughput = mi.Spectrum(1.0)
@@ -462,11 +469,11 @@ def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2:
             1.0
         )
 
-        L += dr.select(
-            hit_emitter,
-            throughput * Le * mis_bsdf_hit,
-            0.0
-        )
+        # L += dr.select(
+        #     hit_emitter,
+        #     throughput * Le * mis_bsdf_hit,
+        #     0.0
+        # )
 
         # In this simple implementation, terminate once an emitter is reached
         active_path &= ~hit_emitter

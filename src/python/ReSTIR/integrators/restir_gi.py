@@ -8,7 +8,7 @@ from utilsGI import *
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
 
-SPATIAL_NEIGHBOR_COUNT = 10
+SPATIAL_NEIGHBOR_COUNT = 3
 SPATIAL_NEIGHBOR_RADIUS = 10
 
 class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
@@ -189,9 +189,6 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                     self.previousGrid = Reservoir.empty(pixel_count)
                     self.currentGrid  = Reservoir.empty(pixel_count)
 
-                # if self.previous_camera is None:
-                #     self.prepare_frame(sensor)
-    
                 # Generate a set of rays starting at the sensor + their discrete pixel indices
                 ray, weight, splatting_pos, pixel_index = self.sample_rays(scene, sensor, sampler)
 
@@ -248,6 +245,7 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 
                 L = self.evaluate_reservoir(scene, sampler, ray, si, spacial_reservoir, valid_ray, direct_emission)
+
 
                 valid = valid_ray
                 aovs = []
@@ -363,17 +361,15 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         
             # Construct a candidate sample for the reservoir
-            candidate = Sample(x1=x1.p, x1_n=x1.n, x2=x2.p, x2_n=x2.n, pdf=bs_1.pdf, radiance=Lo_x2, random_x1=random_x1, random_x2=random_x2)
+            candidate = Sample(x1=x1.p, x1_n=x1.n, x1_si = x1, x2=x2.p, x2_n=x2.n, pdf=bs_1.pdf, radiance=Lo_x2, random_x1=random_x1, random_x2=random_x2)
 
             # bsdf contribution at x1
             candidate_weight_spectrum = bsdf_weight_1 * Lo_x2
             reservoir_weight = mi.luminance(mi.unpolarized_spectrum(candidate_weight_spectrum), x1.wavelengths, active_x2)
 
-
             current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=sampler.next_1d(active_x2), active=active_x2)
 
-
-        p_hat_current = eval_p_hat_normalized(scene, x1, current_reservoir.select, bsdf_x1, bsdf_ctx, sampler, active_x1)
+        p_hat_current = eval_p_hat(scene, x1, current_reservoir.select, bsdf_x1, bsdf_ctx, sampler, active_x1)
         current_reservoir.finalize(p_hat_current, active_x1)
 
         direct_lighting = direct_emission + direct_nee
@@ -451,8 +447,8 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
         selected_candidate = reservoir.select
 
         # To get the integral estimator, we need to compute I = f(X) * W_X
-        p_hat_X_spectrum = eval_p_hat_spectrum_normalized(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
-        p_hat = eval_p_hat_normalized(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
+        p_hat_X_spectrum = eval_p_hat_spectrum(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
+        p_hat = eval_p_hat(scene, si, selected_candidate, bsdf, bsdf_ctx, sampler, active)
 
         
         # Trace a ray from the original intersection point to the selected candidate point and check for visibility
