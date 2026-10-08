@@ -412,7 +412,7 @@ def reconnection_jacobian(source_x1: mi.Point3f, target_x1: mi.Point3f, x2: mi.P
 
     return dr.select(valid, J, 0.0)
 
-def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2: mi.RayDifferential3f, sampler: mi.Sampler, first_random: mi.Vector3f, active: mi.Mask, max_depth: int = 1) -> mi.Spectrum:
+def trace_radiance_from_x2(scene: mi.Scene, x2: mi.SurfaceInteraction3f, ray_x2: mi.RayDifferential3f, sampler: mi.Sampler, first_random: mi.Vector3f, active: mi.Mask, max_depth: int = 5) -> mi.Spectrum:
 
     L = dr.zeros(mi.Spectrum, dr.width(x2.p))
     throughput = mi.Spectrum(1.0)

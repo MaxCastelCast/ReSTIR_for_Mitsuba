@@ -18,10 +18,10 @@ import nanogui as ng
 import numpy as np
 from nanogui.interop import FrameStream, drjit_sink
 
-import temp_reuse
-import ris_di
-import restir_di
-import restir_gi
+# import temp_reuse
+# import ris_di
+# import restir_di
+# import restir_gi
 
 VARIANTS = ("cuda_ad_rgb", "metal_ad_rgb", "llvm_ad_rgb")
 
@@ -1519,12 +1519,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def run() -> None:
+
+    global temp_reuse, ris_di, restir_di, restir_gi
+
     args = parse_args()
     settings = Settings.load()
     if args.variant:
         mi.set_variant(args.variant)
     else:
         mi.set_variant(*dict.fromkeys((*filter(None, [settings.variant]), *VARIANTS)))
+
+    # 2. Register custom integrators after selecting the variant
+    import temp_reuse
+    import ris_di
+    import restir_di
+    import restir_gi
 
     ng.init()
     width, height = (int(value) for value in args.size.lower().split("x"))
