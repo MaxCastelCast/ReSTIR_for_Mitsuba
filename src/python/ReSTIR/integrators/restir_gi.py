@@ -471,7 +471,7 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 
     def to_string(self):
-        return "TemporalReuseIntegrator[]"
+        return "ReSTIR_GI_Integrator[]"
 
 
 # Register the integrator as a Mitsuba plugin
