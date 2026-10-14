@@ -222,8 +222,6 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                     temporal_reservoir.select.x2,
                     temporal_reservoir.select.x2_n,
                     temporal_reservoir.select.radiance,
-                    temporal_reservoir.select.random_x1,
-                    temporal_reservoir.select.random_x2,
                 )
 
                 spacial_reservoir = self.sample_spacial_reuse(scene, sampler, ray, si, temporal_reservoir, valid_ray, film_width, film_height, pixel_index)
@@ -239,8 +237,6 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                     spacial_reservoir.select.x2,
                     spacial_reservoir.select.x2_n,
                     spacial_reservoir.select.radiance,
-                    spacial_reservoir.select.random_x1,
-                    spacial_reservoir.select.random_x2
                 )
 
 
@@ -265,12 +261,9 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
                     self.currentGrid.select.x2,
                     self.currentGrid.select.x2_n,
                     self.currentGrid.select.radiance,
-                    self.currentGrid.select.random_x1,
-                    self.currentGrid.select.random_x2
                 )
 
                 self.previousGrid, self.currentGrid = (self.currentGrid, self.previousGrid)
-                #self.prepare_next_frame(sensor)
 
     
                 # Prepare an ImageBlock as specified by the film
@@ -338,8 +331,6 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
             rD1, rD2, rD3 = sampler.next_1d(active_x1), sampler.next_1d(active_x1), sampler.next_1d(active_x1)
 
-            random_x1 = mi.Vector3f(rD1, rD2, rD3)
-
             bs_1, bsdf_weight_1 = bsdf_x1.sample(bsdf_ctx, x1, rD1, mi.Point2f(rD2, rD3), active_x1)
 
             active_x2 = (active_x1 & (bs_1.pdf > 0.0))
@@ -361,7 +352,7 @@ class Restir_Gi_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         
             # Construct a candidate sample for the reservoir
-            candidate = Sample(x1=x1.p, x1_n=x1.n, x1_si = x1, x2=x2.p, x2_n=x2.n, pdf=bs_1.pdf, radiance=Lo_x2, random_x1=random_x1, random_x2=random_x2)
+            candidate = Sample(x1=x1.p, x1_n=x1.n, x1_si = x1, x2=x2.p, x2_n=x2.n, pdf=bs_1.pdf, radiance=Lo_x2)
 
             # bsdf contribution at x1
             candidate_weight_spectrum = bsdf_weight_1 * Lo_x2

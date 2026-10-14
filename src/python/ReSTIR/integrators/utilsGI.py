@@ -46,13 +46,6 @@ class Sample:
     # unoccluded radiance contribution associated with that light sample
     radiance: mi.Spectrum = field(default_factory=lambda: mi.Spectrum(0.0))
 
-    # UNUSED : random numbers used for the BSDF event at x1
-    random_x1: mi.Vector3f = field(default_factory=mi.Vector3f)
-
-    # UNUSED random numbers used for the BSDF event at x2
-    random_x2: mi.Vector3f = field(default_factory=mi.Vector3f)
-
-
     @staticmethod
     def make_empty_sample(width):
         return Sample(
@@ -62,9 +55,7 @@ class Sample:
             x2=dr.zeros(mi.Point3f, width),
             x2_n=dr.zeros(mi.Normal3f, width),
             pdf=dr.zeros(mi.Float, width),
-            radiance=dr.zeros(mi.Spectrum, width),
-            random_x1=dr.zeros(mi.Vector3f, width),
-            random_x2=dr.zeros(mi.Vector3f, width)
+            radiance=dr.zeros(mi.Spectrum, width)
         )
 
 @dataclass
@@ -210,8 +201,6 @@ def gather_sample(sample: Sample, index: mi.UInt32, active: mi.Mask) -> Sample:
         x2_n=dr.gather(mi.Normal3f, sample.x2_n, index, active),
         pdf=dr.gather(mi.Float, sample.pdf, index, active),
         radiance=dr.gather(mi.Spectrum, sample.radiance, index, active),
-        random_x1=dr.gather(mi.Vector3f, sample.random_x1, index, active),
-        random_x2=dr.gather(mi.Vector3f, sample.random_x2, index, active)
     )
 
 # Gathers the reservoirs associated with the indexes
@@ -232,8 +221,6 @@ def scatter_sample(target: Sample, source: Sample, index: mi.UInt32, active: mi.
     dr.scatter(target.x2_n, source.x2_n, index, active=active)
     dr.scatter(target.pdf, source.pdf, index, active=active)
     dr.scatter(target.radiance, source.radiance, index, active=active)
-    dr.scatter(target.random_x1, source.random_x1, index, active=active)
-    dr.scatter(target.random_x2, source.random_x2, index, active=active)
 
 
 # Store resulting reservoir for next frame
