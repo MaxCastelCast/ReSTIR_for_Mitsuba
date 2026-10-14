@@ -1519,27 +1519,36 @@ def parse_args() -> argparse.Namespace:
 
 
 def run() -> None:
-
     global temp_reuse, ris_di, restir_di, restir_gi
+
+    print("1. Entered run()", flush=True)
 
     args = parse_args()
     settings = Settings.load()
+
     if args.variant:
         mi.set_variant(args.variant)
     else:
         mi.set_variant(*dict.fromkeys((*filter(None, [settings.variant]), *VARIANTS)))
 
-    # 2. Register custom integrators after selecting the variant
+    print("2. Mitsuba initialized", flush=True)
+
     import temp_reuse
     import ris_di
     import restir_di
     import restir_gi
 
+    print("3. Custom integrators imported", flush=True)
+
     ng.init()
+
+    print("4. NanoGUI initialized", flush=True)
+
     width, height = (int(value) for value in args.size.lower().split("x"))
     scene = args.scene.expanduser() if args.scene is not None else None
     integrator = None if args.integrator == "scene" else args.integrator
     rfilter = None if args.filter == "scene" else args.filter
+
     viewer = Viewer(
         scene,
         ng.Vector2i(width, height),
@@ -1547,13 +1556,21 @@ def run() -> None:
         integrator=integrator,
         rfilter=rfilter,
     )
+
+    print("5. Viewer created", flush=True)
+
     viewer.set_visible(True)
+
+    print("6. Starting NanoGUI event loop", flush=True)
+
     try:
         ng.run()
     finally:
         if viewer.stream is not None:
             viewer.stream.close()
         ng.shutdown()
+
+    print("7. Viewer closed", flush=True)
 
 
 if __name__ == "__main__":

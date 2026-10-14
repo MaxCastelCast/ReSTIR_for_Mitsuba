@@ -1,0 +1,27 @@
+[workspace]
+authors = ["MaxCastelCast <maximo.castellari@epfl.ch>"]
+name = "restir-research"
+version = "0.1.0"
+description = "ReSTIR path tracing research project using Mitsuba 3"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+numpy = "*"
+
+[pypi-dependencies]
+mitsuba = "==3.9.0"
+
+nanogui = { git = "https://github.com/mitsuba-renderer/nanogui.git", rev = "d50f6c15d30133b43217028fe7915f09ee79db87" }
+
+[tasks]
+
+# Verify that Mitsuba and Dr.Jit can initialize CUDA
+test-cuda = "python -c \"import mitsuba as mi; import drjit as dr; mi.set_variant('cuda_ad_rgb'); print('CUDA OK')\""
+
+# Verify that NanoGUI and its Dr.Jit interoperability module are available
+test-nanogui = "python -c \"import nanogui as ng; from nanogui.interop import FrameStream, drjit_sink; print('NanoGUI OK')\""
+
+# Launch the ReSTIR viewer
+viewer = "cd integrators && __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia python -m viewer --variant cuda_ad_rgb"
