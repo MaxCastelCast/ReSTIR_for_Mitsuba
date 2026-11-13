@@ -25,7 +25,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
     current_x1_buffer: X1_Geometry_Buffer = None
 
 
-    # Number of ReSTIR GI proposals per primary sample
+    # Number of ReSTIR PT proposals per primary sample
     initial_path_count: int = 2
 
     def __init__(self, props):
@@ -203,7 +203,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 
                 # PHASE 1
-                initial_reservoir, si, valid_ray = self.sample_initial_reservoir(scene, sampler, mi.UInt32(seed), pixel_index, ray, mi.Bool(True))
+                initial_reservoir, si, valid_ray, short_path_radiance = self.sample_initial_reservoir(scene, sampler, mi.UInt32(seed), pixel_index, ray, mi.Bool(True))
 
                 # Fill the primary surface information for temporal reuse for next frame
                 current_geometry = X1_Geometry_Buffer(x1_pos=si.p, x1_norm=si.n, primary_ray=mi.Ray3f(ray), valid=valid_ray)
@@ -239,26 +239,22 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
                     temporal_reservoir.select.outgoingDirection,
                 )
 
-                # spacial_reservoir = self.sample_spacial_reuse(scene, sampler, ray, si, temporal_reservoir, valid_ray, film_width, film_height, pixel_index)
+                spacial_reservoir = self.sample_spatial_reuse(scene=scene, sampler=sampler, ray=ray, si=si, initial_reservoir=temporal_reservoir, valid_ray=valid_ray, film_width=film_width, film_height=film_height, pixel_index=pixel_index)
 
-                # sampler.schedule_state()
-                # dr.eval(
-                #     spacial_reservoir.w_sum,
-                #     spacial_reservoir.M,
-                #     spacial_reservoir.W,
-                #     spacial_reservoir.select.pdf,
-                #     spacial_reservoir.select.x1,
-                #     spacial_reservoir.select.x1_n,
-                #     spacial_reservoir.select.x2,
-                #     spacial_reservoir.select.x2_n,
-                #     spacial_reservoir.select.radiance,
-                # )
-
-
-                #L = self.evaluate_reservoir(scene, sampler, ray, si, spacial_reservoir, valid_ray, direct_emission)
+                sampler.schedule_state()
+                dr.eval(
+                    spacial_reservoir.w_sum,
+                    spacial_reservoir.M,
+                    spacial_reservoir.W,
+                    spacial_reservoir.select.pdf,
+                    spacial_reservoir.select.J,
+                    spacial_reservoir.select.seed,
+                    spacial_reservoir.select.incomingRadiance,
+                    spacial_reservoir.select.outgoingDirection,
+                )
 
                 # Evaluate the selected reservoir
-                L = self.evaluate_reservoir(scene=scene, sampler=sampler, ray=ray, si=si, reservoir=temporal_reservoir, valid_ray=valid_ray, direct_emission=mi.Spectrum(0.0))
+                L = self.evaluate_reservoir(scene=scene, sampler=sampler, ray=ray, si=si, reservoir=spacial_reservoir, valid_ray=valid_ray, direct_emission=short_path_radiance)
 
                 valid = valid_ray
                 aovs = []
@@ -309,116 +305,88 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         
 
 
-    # ReSTIR PT intitial reservoir sampling, do simple path tracing to generate a set of initial candidates and store them in the reservoir (without NEE for now)
-    # PATH_LENGTH : The total number of edges (counting the one from the camera to the first vertex x1)
-    def sample_initial_reservoir(self, scene: mi.Scene, reservoir_sampler: mi.Sampler, frame_id: mi.UInt32, pixel_index: mi.UInt32, ray: mi.RayDifferential3f, active: mi.Mask = True) -> tuple[Reservoir, mi.SurfaceInteraction3f, mi.Mask]:
+    # ReSTIR PT initial reservoir sampling, without NEE.
+    # PATH_LENGTH: Total number of edges, including the camera -> x1 edge.
+    def sample_initial_reservoir(self, scene: mi.Scene, reservoir_sampler: mi.Sampler, frame_id: mi.UInt32, pixel_index: mi.UInt32, ray: mi.RayDifferential3f, active: mi.Mask = True) -> tuple[Reservoir, mi.SurfaceInteraction3f, mi.Mask, mi.Spectrum]:
 
-        # Initialize the reservoir
+        # For now, use a fixed reconnection vertex x2
+        k = 2
+
+        # Initialize reservoir
         width = dr.width(ray)
         current_reservoir = Reservoir.empty(width)
+        selected_p_hat = dr.zeros(mi.Float, width)
         bsdf_ctx = mi.BSDFContext()
 
-        # The importance of each sample 
-        selected_p_hat = dr.zeros(mi.Float, width)
+        # Initialize short-path radiance accumulator
+        short_path_radiance = dr.zeros(mi.Spectrum, width)
 
-        # Seed the sampler for the current pixel 
+        # Seed the sampler for the current pixel
         pixel_seed = seed_pixel(pixel_index, frame_id)
 
-        # Compute primary intersection
+        # Compute primary intersection x1
         x1 = scene.ray_intersect(ray, active=active)
         valid_ray = active & x1.is_valid()
 
-        # Store the pdf from x1 toward x2 : the probability to sample x2
-        reconnection_pdf = 0
-
         # Generate initial ReSTIR PT candidates
-        # For now, we only choose paths with reconnection vertices = 2
         for path_index in range(self.initial_path_count):
 
-            # Intitialize accumulated radiance and throughput
-            throughput = mi.Spectrum(1.0)
-            L = dr.zeros(mi.Spectrum, width)
-            current_ray = ray
-            active_path = valid_ray
-
-            # Seed the sampler for the current path 
+            # Create a deterministic sampler for the current path
             path_seed, _ = mi.sample_tea_32(pixel_seed, mi.UInt32(path_index))
             path_sampler = create_path_sampler(path_seed, width)
 
-            for i in range(PATH_LENGTH):
+            # Trace prefix from x1 to x(k-1), then sample the ray toward xk
+            prefix_throughput, incoming_xk_pdf, ray_to_xk, prefix_radiance, valid_prefix = trace_prefix_throughput(scene=scene, sampler=path_sampler, k=k, active=valid_ray, max_depth=PATH_LENGTH, x1=x1, ray_x0=ray)
 
-                # Trace the ray and compute the surface interaction
-                preliminary_x = scene.ray_intersect_preliminary(ray=current_ray, coherent=(i == 0), active=active_path)
-                x = preliminary_x.compute_surface_interaction(ray=current_ray, ray_flags=mi.RayFlags.All, active=active_path)
+            # Accumulate prefix emission (average across initial paths)
+            short_path_radiance += prefix_radiance / self.initial_path_count
 
-                active_path &= x.is_valid()
-                if i == 0 : valid_ray = active_path
+            # Intersect the reconnection vertex xk
+            preliminary_xk = scene.ray_intersect_preliminary(ray=ray_to_xk, coherent=False, active=valid_prefix)
+            xk = preliminary_xk.compute_surface_interaction(ray=ray_to_xk, ray_flags=mi.RayFlags.All, active=valid_prefix)
+            valid_xk = valid_prefix & xk.is_valid()
 
-                # Evaluate emitted radiance at current vertex
-                emitter = x.emitter(scene, active_path)
-                Le = emitter.eval(x, active_path)
-                L += dr.select(active_path, throughput * Le, 0.0)
+            # Accumulate emission at xk (BSDF-sampled direct illumination for k=2)
+            emitter_xk = xk.emitter(scene, valid_xk)
+            Le_xk = emitter_xk.eval(xk, valid_xk)
+            short_path_radiance += dr.select(valid_xk, prefix_throughput * Le_xk / self.initial_path_count, mi.Spectrum(0.0))
 
-                # Get the BSDF at the current vertex
-                bsdf_x = x.bsdf(current_ray)
+            # Trace postfix starting at xk
+            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, sampler=path_sampler, active=valid_xk, max_depth=PATH_LENGTH - k)
 
-                # Construct a candidate sample for the reservoir (for now we only consider paths with reconnection vertices = 2)
-                if i == 1:
-                    # Compute postfix
-                    incoming_radiance, outgoing_direction  = trace_postfix_radiance(scene, x, current_ray, path_sampler, active_path, PATH_LENGTH - i - 1)
+            # Evaluate BSDF at xk for the sampled outgoing direction
+            bsdf_xk = xk.bsdf(ray_to_xk)
+            wo_local = xk.to_local(outgoing_direction)
+            bsdf_val, bsdf_pdf = bsdf_xk.eval_pdf(bsdf_ctx, xk, wo_local, valid_xk)
+            bsdf_val = xk.to_world_mueller(bsdf_val, -wo_local, xk.wi)
 
-                    # Compute the radiance contribution of the current candidate sample
-                    wo_local = x.to_local(outgoing_direction)
-                    bsdf_val, bsdf_pdf = bsdf_x.eval_pdf(bsdf_ctx, x, wo_local, active_path)
-                    bsdf_val = x.to_world_mueller(bsdf_val, -wo_local, x.wi)
-                    safe_pdf = dr.select(bsdf_pdf > 0.0, bsdf_pdf, 1.0)
-                    bsdf_weight = dr.select(bsdf_pdf > 0.0, bsdf_val / safe_pdf, 0.0)
-                    candidate_contribution = throughput * bsdf_weight * incoming_radiance
+            # Compute BSDF sampling weight at xk
+            safe_pdf = dr.select(bsdf_pdf > 0.0, bsdf_pdf, 1.0)
+            bsdf_weight = dr.select(bsdf_pdf > 0.0, bsdf_val / safe_pdf, mi.Spectrum(0.0))
 
-                    # Construct a candidate sample for the reservoir
-                    candidate = Sample(outgoingDirection=outgoing_direction, incomingRadiance=incoming_radiance, surfaceInformation=preliminary_x, seed=path_seed, k=mi.UInt32(i+1), J=mi.Float(1.0), pdf=reconnection_pdf)
-                    reservoir_weight = mi.luminance(mi.unpolarized_spectrum(candidate_contribution), x.wavelengths, active_path)
+            # Compute full importance-sampled candidate contribution
+            candidate_contribution = prefix_throughput * bsdf_weight * incoming_radiance
 
-                    # Add candidate to reservoir
-                    replace = current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=reservoir_sampler.next_1d(active_path), active=active_path)
+            # Construct ReSTIR PT candidate
+            candidate = Sample(outgoingDirection=outgoing_direction, incomingRadiance=incoming_radiance, surfaceInformation=preliminary_xk, seed=path_seed, k=mi.UInt32(k), J=mi.Float(1.0), pdf=incoming_xk_pdf)
 
-                    # Recover the target function by removing
-                    # the division by the x1 -> x2 sampling PDF
-                    p_hat_candidate = reservoir_weight * bs_k.pdf
+            # Compute reservoir importance weight
+            reservoir_weight = mi.luminance(mi.unpolarized_spectrum(candidate_contribution), xk.wavelengths, valid_xk)
+            reservoir_weight = dr.select(valid_xk, reservoir_weight, 0.0)
 
-                    # Remember p_hat of the selected candidate
-                    selected_p_hat = dr.select(replace, p_hat_candidate, selected_p_hat)
+            # Add candidate to the reservoir (all valid primary rays count toward M)
+            replace = current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=reservoir_sampler.next_1d(valid_ray), active=valid_ray)
 
-                    # The postfix helper has already traced the remaining path
-                    break
+            # Recover target function by removing the x1 -> x2 proposal PDF
+            p_hat_candidate = reservoir_weight * incoming_xk_pdf
 
+            # Save target importance of the selected candidate
+            selected_p_hat = dr.select(replace, p_hat_candidate, selected_p_hat)
 
-                # Evaluate the BSDF for the next sample 
-                rD1, rD2, rD3 =  path_sampler.next_float(mi.Float, active_path),  path_sampler.next_float(mi.Float, active_path), path_sampler.next_float(mi.Float, active_path)
-                bs_k, bsdf_weight_k = bsdf_x.sample(bsdf_ctx, x, rD1, mi.Point2f(rD2, rD3), active_path)
-
-                # For k=2, this is the PDF of x1 -> x2
-                if i == 0:
-                    reconnection_pdf = bs_k.pdf
-
-                active_path_next = (active_path & (bs_k.pdf > 0.0))
-                bsdf_weight_k = x.to_world_mueller(bsdf_weight_k, -bs_k.wo, x.wi)
-
-                # Update throughput
-                throughput *= bsdf_weight_k
-
-                # Outgoing direction in world space
-                wo_world_k = x.to_world(bs_k.wo)
-
-                # Go to the next ray
-                active_path = active_path_next
-                current_ray = x.spawn_ray(wo_world_k)
-
-        # Finalize the reservoir using the importance
-        # of the selected candidate
+        # Finalize reservoir
         current_reservoir.finalize(p_hat_selected=selected_p_hat, active=valid_ray)
 
-        return (current_reservoir, x1, valid_ray)
+        return current_reservoir, x1, valid_ray, short_path_radiance
 
     def sample_temporal_reuse(self, scene: mi.Scene, sensor: mi.Sensor, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, initial_reservoir: Reservoir, valid_ray: mi.Mask, film_width: int, film_height: int, pixel_index: mi.UInt32) -> Reservoir:
         active = valid_ray
@@ -426,9 +394,6 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         # No temporal history yet
         if self.previous_camera is None:
             return initial_reservoir
-
-        bsdf = si.bsdf(ray)
-        bsdf_ctx = mi.BSDFContext()
 
         # 1) Determine which temporal sample corresponds to our current pixel
         previous_index, valid_reprojection = eval_previous_index(si, self.previous_camera, sensor, sampler, film_width, film_height, pixel_index, active)
@@ -445,7 +410,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         # If the shift mapping is not successful, we cannot use the previous sample for temporal reuse and we keep the current sample as is
         temporal_primary_ray = previous_x1_geometry.primary_ray
         current_primary_ray = mi.Ray3f(ray)
-        J, shifted_radiance, p_hat_temporal, target_bsdf_pdf, valid_shift_mapping = shift_mapping(scene, temporal_primary_ray, initial_reservoir, current_primary_ray, previous_reservoir,previous_index, sampler,  active_history)
+        J, p_hat_temporal, target_bsdf_pdf, valid_shift_mapping = shift_mapping(scene, temporal_primary_ray, initial_reservoir, current_primary_ray, previous_reservoir,previous_index, sampler,  active_history)
 
     
         # Current strategy evaluated at initial candidate
@@ -471,7 +436,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         # Compute the target radiance function of both the initial function and the target function
         initial_x2, valid_initial = reconstruct_initial_reconnection(scene=scene, current_si=si, current_ray=current_primary_ray, candidate=initial_reservoir.select, active=active)
-        initial_p_hat = eval_p_hat(current_si=si, reconnection_si=initial_x2, candidate=initial_reservoir.select, bsdf_ctx=bsdf_ctx, active=valid_initial)
+        initial_p_hat = eval_p_hat(current_si=si, reconnection_si=initial_x2, candidate=initial_reservoir.select, bsdf_ctx=mi.BSDFContext(), active=valid_initial)
         temporal_p_hat = p_hat_temporal
 
         # Create the reservoir n-uples for the reservoir combination phase
@@ -483,35 +448,69 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         return temporal_reservoir
 
-    # def sample_spacial_reuse(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, temporal_reservoir: Reservoir, valid_ray: mi.Mask, film_width: int, film_height: int, pixel_index: mi.UInt32) -> Reservoir:
-    #     active = valid_ray
-    #     bsdf = si.bsdf(ray)
-    #     bsdf_ctx = mi.BSDFContext()
 
-    #     # Create a list of reservoir to be combined later on at the end
-    #     reservoirs = [(temporal_reservoir, active)]
-        
-    #     # Concatenate the reservoir samples to be combined at the end
-    #     for _ in range(SPATIAL_NEIGHBOR_COUNT):
-    #         # 1) Determine which spacial samples correspond t our current pixels
-    #         neighbor_index, valid_neighbors = eval_selected_neighbor(sampler, film_width, film_height, pixel_index, SPATIAL_NEIGHBOR_RADIUS, active)
+    def sample_spatial_reuse(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, initial_reservoir: Reservoir, valid_ray: mi.Mask, film_width: int, film_height: int, pixel_index: mi.UInt32) -> Reservoir:
+        active = valid_ray
+        bsdf_ctx = mi.BSDFContext()
+        current_primary_ray = mi.Ray3f(ray)
 
-    #         # Gather the neighbors
-    #         neighbor_reservoir = gather_reservoir(temporal_reservoir, neighbor_index, valid_neighbors)
+        # 1. Evaluate the current pixel's initial candidate
+        current_x2, valid_current = reconstruct_reconnection_vertex(scene=scene, current_si=si, candidate=initial_reservoir.select, active=active)
+        current_p_hat = eval_p_hat(current_si=si, reconnection_si=current_x2, candidate=initial_reservoir.select, bsdf_ctx=bsdf_ctx, active=valid_current)
 
-    #         # /!\ We have to first check if we can use spacial reuse with geometry similarity tests 
-    #         # Use geometric check to verify if the temporal sample is useful for our current geometry
-    #         #valid_neighborhood = validate_surface_similarity(si.p, si.n, neighbor_reservoir.select.x1, neighbor_reservoir.select.x1_n, valid_neighbors)
+        # Store all reservoir candidates before combining them
+        reservoir_data = []
 
-    #         # Append the reservoir to our list of reservoirs
-    #         #reservoirs.append((neighbor_reservoir, valid_neighborhood))
+        # Count the number of usable source reservoirs
+        valid_initial_reservoir = active & valid_current & (initial_reservoir.W > 0.0) & (current_p_hat > 0.0)
+        valid_reservoir_count = dr.select(valid_initial_reservoir, mi.Float(1.0), mi.Float(0.0))
 
+        # 2. Sample neighboring pixels
+        for _ in range(SPATIAL_NEIGHBOR_COUNT):
 
-    #     # 2) Merge all the neighbor reservoirs with the current reservoir
-    #     spacial_reservoir = combine_reservoirs(scene, si, bsdf, bsdf_ctx, sampler, True, active, *reservoirs)
+            # Randomly select a neighbor
+            neighbor_index, valid_neighbor = eval_selected_neighbor(sampler, film_width, film_height, pixel_index, SPATIAL_NEIGHBOR_RADIUS, active)
 
-    #     return spacial_reservoir
+            # Retrieve the neighbor reservoir from the frozen initial-reservoir buffer
+            neighbor_reservoir = gather_reservoir(initial_reservoir, neighbor_index, valid_neighbor)
 
+            # Retrieve the neighbor's primary geometry and ray
+            neighbor_geometry = gather_x1_geometry_buffer(self.current_x1_buffer, neighbor_index, valid_neighbor)
+
+            # 3. Check primary surface similarity
+            position_difference = dr.norm(si.p - neighbor_geometry.x1_pos)
+            normal_similarity = dr.dot(si.n, neighbor_geometry.x1_norm)
+            valid_neighbor &= neighbor_geometry.valid & (neighbor_reservoir.W > 0.0)
+            valid_neighbor &= (position_difference < POSITION_THRESHOLD) & (normal_similarity > NORMAL_THRESHOLD)
+
+            # 4. Shift the neighbor's selected path to the current pixel
+            neighbor_primary_ray = neighbor_geometry.primary_ray
+            J, p_hat_spatial, target_bsdf_pdf, valid_shift = shift_mapping(scene, neighbor_primary_ray, initial_reservoir, current_primary_ray, neighbor_reservoir, neighbor_index, sampler, valid_neighbor)
+
+            # Reject invalid shifts
+            valid_shift &= (J > 0.0) & dr.isfinite(J) & (p_hat_spatial > 0.0) & dr.isfinite(p_hat_spatial)
+
+            # 5. Store the neighbor for reservoir combination
+            reservoir_data.append((neighbor_reservoir, p_hat_spatial, J, valid_shift))
+            valid_reservoir_count += dr.select(valid_shift, mi.Float(1.0), mi.Float(0.0))
+
+        # 6. Assign equal mixture weights to accepted source reservoirs
+        safe_count = dr.select(valid_reservoir_count > 0.0, valid_reservoir_count, 1.0)
+
+        # TODO : change the weights so that it respects the MIS weights conventions later on
+        uniform_mis_weight = dr.rcp(safe_count)
+
+        # Add the current pixel's reservoir
+        combined_data = [(initial_reservoir, uniform_mis_weight, current_p_hat, mi.Float(1.0), valid_initial_reservoir)]
+
+        # Add neighboring reservoirs
+        for neighbor_reservoir, p_hat_spatial, J, valid_shift in reservoir_data:
+            combined_data.append((neighbor_reservoir, uniform_mis_weight, p_hat_spatial, J, valid_shift))
+
+        # 7. Combine the current reservoir with its neighbors
+        spatial_reservoir = combine_reservoirs(sampler, active, *combined_data)
+
+        return spatial_reservoir
 
 
     def evaluate_reservoir(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, reservoir: Reservoir, valid_ray: mi.Mask, direct_emission: mi.Spectrum) -> mi.Spectrum:
