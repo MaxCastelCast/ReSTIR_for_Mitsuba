@@ -412,24 +412,26 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         current_primary_ray = mi.Ray3f(ray)
         J, p_hat_temporal, target_bsdf_pdf, valid_shift_mapping = shift_mapping(scene, temporal_primary_ray, initial_reservoir, current_primary_ray, previous_reservoir,previous_index, sampler,  active_history)
 
-    
-        # Current strategy evaluated at initial candidate
-        initial_sample_pdf = initial_reservoir.select.pdf
 
-        # Temporal strategy evaluated at initial candidate
-        proxy_temporal_sample_pdf = compute_temporal_pdf_proxy_at_initial(scene=scene, temporal_primary_ray=temporal_primary_ray, current_primary_ray=current_primary_ray, initial_reservoir=initial_reservoir, active=active_history)
-        
-        # Current strategy evaluated at shifted temporal candidate
-        proxy_initial_sample_pdf = target_bsdf_pdf
+        # Current strategy evaluated at the freshly generated initial candidate
+        initial_sample_pdf = dr.select(active & (initial_reservoir.W > 0.0), initial_reservoir.select.pdf, 0.0)
 
-        # Temporal strategy evaluated at shifted temporal candidate
-        valid_J = valid_shift_mapping & (J > 0.0) & dr.isfinite(J)
-        safe_J = dr.select(valid_J, J, 1.0)
-        temporal_sample_pdf = dr.select(valid_J,previous_reservoir.select.pdf / safe_J, 0.0)
+        # Temporal strategy evaluated at the initial candidate
+        proxy_temporal_sample_pdf, _, valid_temporal_proxy = compute_shifted_pdf_proxy(scene=scene, source_primary_ray=temporal_primary_ray, target_primary_ray=current_primary_ray, candidate=initial_reservoir.select, max_k=PATH_LENGTH, active=active_history)
 
-        # Compute the MIS weights of the initial sample and the temporal sample
-        mis_initial = mis_weight(initial_sample_pdf, proxy_temporal_sample_pdf, 1, 1, 1)
-        mis_temporal = mis_weight(temporal_sample_pdf, proxy_initial_sample_pdf, 1, 1, 1)
+        proxy_temporal_sample_pdf = dr.select(valid_temporal_proxy, proxy_temporal_sample_pdf, 0.0)
+
+        # Current strategy evaluated at the shifted temporal candidate
+        proxy_initial_sample_pdf = dr.select(valid_shift_mapping, target_bsdf_pdf, 0.0)
+
+        # Temporal strategy evaluated at its selected candidate, expressed in the current domain
+        temporal_sample_pdf, _, valid_temporal_pdf = compute_shifted_pdf_proxy(scene=scene, source_primary_ray=temporal_primary_ray, target_primary_ray=current_primary_ray, candidate=previous_reservoir.select, max_k=PATH_LENGTH, active=active_history & valid_shift_mapping)
+
+        temporal_sample_pdf = dr.select(valid_temporal_pdf, temporal_sample_pdf, 0.0)
+
+        # Compute the MIS weights
+        mis_initial = mis_weight(initial_sample_pdf, proxy_temporal_sample_pdf, selected_index=0, power=1)
+        mis_temporal = mis_weight(temporal_sample_pdf, proxy_initial_sample_pdf, selected_index=0, power=1)
 
         # Add the new jacobian for the shift mapping in the temporal sample
         previous_reservoir.select.J = J
@@ -450,68 +452,76 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 
     def sample_spatial_reuse(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, initial_reservoir: Reservoir, valid_ray: mi.Mask, film_width: int, film_height: int, pixel_index: mi.UInt32) -> Reservoir:
+
         active = valid_ray
         bsdf_ctx = mi.BSDFContext()
         current_primary_ray = mi.Ray3f(ray)
 
-        # 1. Evaluate the current pixel's initial candidate
-        current_x2, valid_current = reconstruct_reconnection_vertex(scene=scene, current_si=si, candidate=initial_reservoir.select, active=active)
-        current_p_hat = eval_p_hat(current_si=si, reconnection_si=current_x2, candidate=initial_reservoir.select, bsdf_ctx=bsdf_ctx, active=valid_current)
+        # 1. Evaluate the current candidate
+        current_xk, valid_current = reconstruct_reconnection_vertex(scene=scene, current_si=si, candidate=initial_reservoir.select, active=active)
+        current_p_hat = eval_p_hat(current_si=si, reconnection_si=current_xk, candidate=initial_reservoir.select, bsdf_ctx=bsdf_ctx, active=valid_current)
+        valid_current &= (initial_reservoir.W > 0.0) & (current_p_hat > 0.0) & dr.isfinite(current_p_hat)
 
-        # Store all reservoir candidates before combining them
-        reservoir_data = []
+        # Each entry contains:
+        # reservoir, primary_ray, p_hat, J, strategy_enabled, candidate_valid
+        strategy_data = [(initial_reservoir, current_primary_ray, current_p_hat, mi.Float(1.0), active, valid_current)]
 
-        # Count the number of usable source reservoirs
-        valid_initial_reservoir = active & valid_current & (initial_reservoir.W > 0.0) & (current_p_hat > 0.0)
-        valid_reservoir_count = dr.select(valid_initial_reservoir, mi.Float(1.0), mi.Float(0.0))
-
-        # 2. Sample neighboring pixels
+        # 2. Gather neighboring strategies
         for _ in range(SPATIAL_NEIGHBOR_COUNT):
 
-            # Randomly select a neighbor
             neighbor_index, valid_neighbor = eval_selected_neighbor(sampler, film_width, film_height, pixel_index, SPATIAL_NEIGHBOR_RADIUS, active)
-
-            # Retrieve the neighbor reservoir from the frozen initial-reservoir buffer
             neighbor_reservoir = gather_reservoir(initial_reservoir, neighbor_index, valid_neighbor)
-
-            # Retrieve the neighbor's primary geometry and ray
             neighbor_geometry = gather_x1_geometry_buffer(self.current_x1_buffer, neighbor_index, valid_neighbor)
+            neighbor_primary_ray = neighbor_geometry.primary_ray
 
-            # 3. Check primary surface similarity
+            # Primary-surface compatibility
             position_difference = dr.norm(si.p - neighbor_geometry.x1_pos)
             normal_similarity = dr.dot(si.n, neighbor_geometry.x1_norm)
-            valid_neighbor &= neighbor_geometry.valid & (neighbor_reservoir.W > 0.0)
-            valid_neighbor &= (position_difference < POSITION_THRESHOLD) & (normal_similarity > NORMAL_THRESHOLD)
 
-            # 4. Shift the neighbor's selected path to the current pixel
-            neighbor_primary_ray = neighbor_geometry.primary_ray
-            J, p_hat_spatial, target_bsdf_pdf, valid_shift = shift_mapping(scene, neighbor_primary_ray, initial_reservoir, current_primary_ray, neighbor_reservoir, neighbor_index, sampler, valid_neighbor)
+            strategy_enabled = valid_neighbor & neighbor_geometry.valid
+            strategy_enabled &= (position_difference < POSITION_THRESHOLD) & (normal_similarity > NORMAL_THRESHOLD)
 
-            # Reject invalid shifts
-            valid_shift &= (J > 0.0) & dr.isfinite(J) & (p_hat_spatial > 0.0) & dr.isfinite(p_hat_spatial)
+            # A strategy can participate even if its selected sample cannot be shifted
+            valid_candidate_source = strategy_enabled & (neighbor_reservoir.W > 0.0)
 
-            # 5. Store the neighbor for reservoir combination
-            reservoir_data.append((neighbor_reservoir, p_hat_spatial, J, valid_shift))
-            valid_reservoir_count += dr.select(valid_shift, mi.Float(1.0), mi.Float(0.0))
+            # Shift the selected candidate
+            J, p_hat_spatial, target_bsdf_pdf, valid_shift = shift_mapping(scene, neighbor_primary_ray, initial_reservoir, current_primary_ray, neighbor_reservoir, neighbor_index, sampler, valid_candidate_source)
 
-        # 6. Assign equal mixture weights to accepted source reservoirs
-        safe_count = dr.select(valid_reservoir_count > 0.0, valid_reservoir_count, 1.0)
+            valid_shift &= (J > 0.0) & dr.isfinite(J)
+            valid_shift &= (p_hat_spatial > 0.0) & dr.isfinite(p_hat_spatial)
 
-        # TODO : change the weights so that it respects the MIS weights conventions later on
-        uniform_mis_weight = dr.rcp(safe_count)
+            strategy_data.append((neighbor_reservoir, neighbor_primary_ray, p_hat_spatial, J, strategy_enabled, valid_shift))
 
-        # Add the current pixel's reservoir
-        combined_data = [(initial_reservoir, uniform_mis_weight, current_p_hat, mi.Float(1.0), valid_initial_reservoir)]
+        # 3. Compute MIS weights for all candidates
+        combined_data = []
 
-        # Add neighboring reservoirs
-        for neighbor_reservoir, p_hat_spatial, J, valid_shift in reservoir_data:
-            combined_data.append((neighbor_reservoir, uniform_mis_weight, p_hat_spatial, J, valid_shift))
+        for candidate_index, (candidate_reservoir, candidate_primary_ray, candidate_p_hat, candidate_J, candidate_strategy_enabled, candidate_valid) in enumerate(strategy_data):
 
-        # 7. Combine the current reservoir with its neighbors
+            candidate_pdfs = []
+
+            for strategy_index, (strategy_reservoir, strategy_primary_ray, strategy_p_hat, strategy_J, strategy_enabled, strategy_candidate_valid) in enumerate(strategy_data):
+
+                # Evaluate the strategy at THIS candidate, independently of its own selected sample
+                active_proxy = active & strategy_enabled & candidate_valid
+
+                proxy_pdf, proxy_J, valid_proxy = compute_shifted_pdf_proxy(scene=scene, source_primary_ray=strategy_primary_ray, target_primary_ray=current_primary_ray, candidate=candidate_reservoir.select, max_k=PATH_LENGTH, active=active_proxy)
+
+                proxy_pdf = dr.select(valid_proxy & dr.isfinite(proxy_pdf) & (proxy_pdf > 0.0), proxy_pdf, 0.0)
+
+                candidate_pdfs.append(proxy_pdf)
+
+            # Balance heuristic
+            mis_candidate = mis_weight(*candidate_pdfs, selected_index=candidate_index, power=1)
+
+            valid_candidate = candidate_valid & (candidate_pdfs[candidate_index] > 0.0)
+            valid_candidate &= (mis_candidate > 0.0) & dr.isfinite(mis_candidate)
+
+            combined_data.append((candidate_reservoir, mis_candidate, candidate_p_hat, candidate_J, valid_candidate))
+
+        # 4. Combine the reservoirs
         spatial_reservoir = combine_reservoirs(sampler, active, *combined_data)
 
         return spatial_reservoir
-
 
     def evaluate_reservoir(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, reservoir: Reservoir, valid_ray: mi.Mask, direct_emission: mi.Spectrum) -> mi.Spectrum:
 

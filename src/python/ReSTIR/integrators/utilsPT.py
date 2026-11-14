@@ -10,19 +10,50 @@ MAX_PATH_LENGTH = 2
 SHIFT_MAPPING_DISTANCE_THRESHOLD = 1e-3
 
 
-def mis_weight(pdf_a: mi.Float, pdf_b: mi.Float, n_a: float, n_b: float, power: int = 2) -> mi.Float:
-    """Compute the MIS weight using the power heuristic."""
+def mis_weight(*pdfs: mi.Float, selected_index: int = 0, power: int = 2, sample_counts: tuple | None = None) -> mi.Float:
+    """
+    Compute the generalized MIS power heuristic.
 
-    a = n_a * pdf_a
-    b = n_b * pdf_b
+    pdfs:
+        Proposal densities of all sampling strategies evaluated at the SAME candidate.
 
-    # Dr.Jit convert automaticaly the ** operator to dr.power
-    a = a ** power
-    b = b ** power
-    
-    w = a / (a + b)
+    selected_index:
+        Index of the strategy whose MIS weight we want.
 
-    return dr.select(dr.isfinite(w), w, 0.0)
+    sample_counts:
+        Optional number of proposals associated with each strategy.
+        Defaults to one proposal per strategy.
+    """
+
+    if len(pdfs) == 0:
+        raise ValueError("At least one PDF is required.")
+
+    if selected_index < 0 or selected_index >= len(pdfs):
+        raise ValueError("Invalid selected_index.")
+
+    if sample_counts is None:
+        sample_counts = (1.0,) * len(pdfs)
+
+    if len(sample_counts) != len(pdfs):
+        raise ValueError("sample_counts must match the number of PDFs.")
+
+    denominator = mi.Float(0.0)
+    numerator = mi.Float(0.0)
+
+    for i, pdf in enumerate(pdfs):
+        valid_pdf = dr.isfinite(pdf) & (pdf > 0.0)
+        safe_pdf = dr.select(valid_pdf, pdf, 0.0)
+        weighted_pdf = sample_counts[i] * safe_pdf
+        term = weighted_pdf ** power
+        denominator += term
+
+        if i == selected_index:
+            numerator = term
+
+    safe_denominator = dr.select(denominator > 0.0, denominator, 1.0)
+    weight = numerator / safe_denominator
+
+    return dr.select((denominator > 0.0) & dr.isfinite(weight), weight, 0.0)
 
 
 # The sample is an indexed vertex on a path
@@ -108,16 +139,13 @@ class Reservoir:
         return replace
 
     # Final computation of the reservoir, must be called before merging reservoirs or getting the selected and W arguments
-    def finalize(self, p_hat_selected: mi.Float, active: mi.Mask, debias_term: mi.Float = None):
+    def finalize(self, p_hat_selected: mi.Float, active: mi.Mask):
 
-        # Use classic M normalization by default
-        normalization = (self.M if debias_term is None else debias_term)
+        active_r = active & (self.M > 0) & (p_hat_selected > 0)
 
-        active_r = active & (self.M > 0) & (normalization > 0) & (p_hat_selected > 0)
-
-        safe_norm = dr.select(active_r, normalization, 1.0)
+        safe_M = dr.select(active_r, self.M, 1.0)
         safe_p_hat = dr.select(active_r, p_hat_selected, 1.0)
-        self.W = dr.select(active_r, self.w_sum / (safe_norm * safe_p_hat) ,0.0)
+        self.W = dr.select(active_r, self.w_sum / (safe_M * safe_p_hat) ,0.0)
 
 @dataclass
 class X1_Geometry_Buffer:
@@ -366,9 +394,6 @@ def eval_p_hat_spectrum(current_si: mi.SurfaceInteraction3f, reconnection_si: mi
       - reconnection_si.wi corresponds to the CURRENT connection.
       - candidate.incomingRadiance stores the suffix radiance
         excluding the BSDF weight at x_k.
-      - candidate.outgoingDirection stores the outgoing world
-        direction sampled at x_k.
-      - Non-delta BSDFs.
     """
 
     valid = active & current_si.is_valid() & reconnection_si.is_valid()
@@ -393,7 +418,7 @@ def eval_p_hat_spectrum(current_si: mi.SurfaceInteraction3f, reconnection_si: mi
     safe_pdf = dr.select(valid,bsdf_pdf_reconnection, 1.0)
 
     # Reconnection BSDF sampling weight
-    weight_reconnection = dr.select(valid, bsdf_val_reconnection / safe_pdf,0.0)
+    weight_reconnection = dr.select(valid, bsdf_val_reconnection / safe_pdf, 0.0)
 
     # 3. Evaluate target contribution
     target_spectrum = bsdf_val_current * weight_reconnection * candidate.incomingRadiance
@@ -551,7 +576,7 @@ def replay_prefix_until_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, pat
     path_sampler = create_path_sampler(path_seed, width)
 
     current_ray = mi.Ray3f(primary_ray)
-    current_si = scene.ray_intersect(current_ray, ray_flags=mi.RayFlags.All, active=active)
+    current_si = scene.ray_intersect(current_ray, ray_flags=mi.RayFlags.All, coherent=False ,active=active)
 
     valid = active & current_si.is_valid() & (k >= 2) & (k <= max_k)
 
@@ -571,7 +596,7 @@ def replay_prefix_until_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, pat
         valid_step = advance & (bs.pdf > 0.0)
 
         next_ray = current_si.spawn_ray(current_si.to_world(bs.wo))
-        next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, active=valid_step)
+        next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=valid_step)
 
         valid &= ~advance | (valid_step & next_si.is_valid())
 
@@ -613,97 +638,132 @@ def shift_mapping_criterions(scene: mi.Scene, yk_previous: mi.SurfaceInteraction
     return active_criterions
 
 
-def compute_temporal_pdf_proxy_at_initial(scene: mi.Scene, temporal_primary_ray: mi.Ray3f, current_primary_ray: mi.Ray3f, initial_reservoir: Reservoir, active: mi.Mask) -> mi.Float:
-    """
-    Evaluate the temporal sampling strategy's transformed PDF proxy
-    at the current pixel's initial reservoir sample.
-
-    For k = 2:
-
-        Initial candidate:
-            Y_I = (y1, y2)
-
-        Hypothetical temporal candidate:
-            X_T* = (x1, y2)
-
-        Transformed PDF proxy:
-            q_T->C(Y_I) = p_T(X_T*) / J_T(X_T*)
-
-    Assumes:
-        - Reconnection at k = 2.
-        - Regular (non-delta) BSDF sampling.
-        - Solid-angle PDFs.
-        - Vertex-preserving reconnection mapping.
-
-    Returns:
-        The transformed temporal PDF proxy.
-        Returns 0 for invalid connections.
-    """
+def compute_shifted_pdf_proxy(scene: mi.Scene, source_primary_ray: mi.Ray3f, target_primary_ray: mi.Ray3f, candidate: Sample, max_k: int, active: mi.Mask) -> tuple[mi.Float, mi.Float, mi.Mask]:
 
     bsdf_ctx = mi.BSDFContext()
-    width = dr.width(current_primary_ray)
 
-    # 1. Reconstruct the initial candidate's x2
+    # 1. Validate candidate
+    valid = active & (candidate.k >= 2) & (candidate.k <= max_k) & candidate.surfaceInformation.is_valid()
 
-    # Reconstruct current pixel's first vertex y1
-    current_si = scene.ray_intersect(current_primary_ray, active=active)
-    valid = active & current_si.is_valid()
+    # 2. Replay source prefix and reconstruct preserved xk
+    source_previous, source_xk, valid_source = replay_path_to_reconnection(scene=scene, primary_ray=source_primary_ray, path_seed=candidate.seed, k=candidate.k, max_k=max_k, active=valid, candidate=candidate, use_stored_xk=True)
+    valid &= valid_source
 
-    # Replay the initial candidate's BSDF sampling
-    # using the stored path seed.
-    path_sampler = create_path_sampler(initial_reservoir.select.seed, width)
-    sample1 = path_sampler.next_float(mi.Float, valid)
-    sample2 = mi.Point2f(path_sampler.next_float(mi.Float, valid), path_sampler.next_float(mi.Float, valid))
+    # 3. Replay target prefix and reconstruct the same preserved xk
+    target_previous, target_xk, valid_target = replay_path_to_reconnection(scene=scene, primary_ray=target_primary_ray, path_seed=candidate.seed, k=candidate.k, max_k=max_k, active=valid, candidate=candidate, use_stored_xk=True)
+    valid &= valid_target
 
-    current_bsdf = current_si.bsdf(current_primary_ray)
-    bs, _ = current_bsdf.sample(bsdf_ctx, current_si, sample1, sample2, valid)
-    valid &= bs.pdf > 0.0
+    # 4. Validate source and target reconnection compatibility
+    valid = shift_mapping_criterions(scene=scene, yk_previous=target_previous, xk_previous=source_previous, xk=target_xk, active=valid)
 
-    # Ray from y1 toward the initial sample's x2
-    ray_to_x2 = current_si.spawn_ray(current_si.to_world(bs.wo))
-
-    # Reconstruct the initial candidate's x2
-    initial_x2 = scene.ray_intersect(ray_to_x2, active=valid)
-
-    valid &= initial_x2.is_valid()
-
-    # 2. Reconstruct the temporal source vertex x1
-    temporal_si = scene.ray_intersect(temporal_primary_ray,active=valid)
-
-    valid &= temporal_si.is_valid()
-
-    # 3. Evaluate temporal BSDF PDF toward initial x2
-    delta = initial_x2.p - temporal_si.p
-
+    # 5. Evaluate source BSDF PDF toward preserved xk
+    delta = source_xk.p - source_previous.p
     dist2 = dr.squared_norm(delta)
-    valid &= dist2 > 0.0
-
+    valid &= (dist2 > 0.0) & dr.isfinite(dist2)
     safe_dist2 = dr.select(valid, dist2, 1.0)
-
     wo_world = delta * dr.rsqrt(safe_dist2)
-    wo_local = temporal_si.to_local(wo_world)
+    wo_local = source_previous.to_local(wo_world)
+    source_bsdf = source_previous.bsdf()
+    source_pdf = source_bsdf.pdf(bsdf_ctx, source_previous, wo_local, valid)
+    valid &= (source_pdf > 0.0) & dr.isfinite(source_pdf)
 
-    temporal_bsdf = temporal_si.bsdf(temporal_primary_ray)
+    # 6. Check visibility of the hypothetical source connection
+    source_connection_ray = source_previous.spawn_ray_to(source_xk.p)
+    source_occluded = scene.ray_test(source_connection_ray, active=valid)
+    valid &= ~source_occluded
 
-    source_pdf = temporal_bsdf.pdf(bsdf_ctx, temporal_si, wo_local, valid)
-
-    valid &= source_pdf > 0.0
-
-    # 4. Check visibility of hypothetical connection
-    connection_ray = temporal_si.spawn_ray_to(initial_x2.p)
-    occluded = scene.ray_test(connection_ray, active=valid)
-    valid &= ~occluded
-
-    # 5. Compute hypothetical reconnection Jacobian
-    J = reconnection_jacobian(source_vertex=temporal_si.p, target_vertex=current_si.p, reconnection_vertex=initial_x2.p, reconnection_normal=initial_x2.n, active=valid)
+    # 7. Compute forward Jacobian from source to target
+    J = reconnection_jacobian(source_vertex=source_previous.p, target_vertex=target_previous.p, reconnection_vertex=target_xk.p, reconnection_normal=target_xk.n, active=valid)
     valid &= (J > 0.0) & dr.isfinite(J)
 
-    # Transform source PDF into current path space
+    # 8. Transform source connection PDF into target domain
     safe_J = dr.select(valid, J, 1.0)
-    proxy = dr.select(valid, source_pdf / safe_J, 0.0)
+    proxy_pdf = dr.select(valid, source_pdf / safe_J, 0.0)
 
-    return proxy
+    # 9. Mask invalid results
+    J = dr.select(valid, J, 0.0)
+    proxy_pdf = dr.select(valid & dr.isfinite(proxy_pdf), proxy_pdf, 0.0)
 
+    return proxy_pdf, J, valid
+
+def replay_path_to_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_seed: mi.UInt32, k: mi.UInt32, max_k: int, active: mi.Mask, x1: mi.SurfaceInteraction3f | None = None, candidate: Sample | None = None, use_stored_xk: bool = False) -> tuple[mi.SurfaceInteraction3f, mi.SurfaceInteraction3f, mi.Mask]:
+    
+    if max_k < 2:
+        raise ValueError("max_k must be >= 2.")
+
+    if use_stored_xk and candidate is None:
+        raise ValueError("candidate is required when use_stored_xk=True.")
+
+    width = dr.width(primary_ray)
+    bsdf_ctx = mi.BSDFContext()
+    path_sampler = create_path_sampler(path_seed, width)
+
+    # 1. Initialize x1
+    current_ray = mi.Ray3f(primary_ray)
+
+    if x1 is None:
+        x1 = scene.ray_intersect(current_ray, ray_flags=mi.RayFlags.All, coherent=False, active=active)
+
+    current_si = x1
+    valid = active & current_si.is_valid() & (k >= 2) & (k <= max_k)
+
+    if use_stored_xk:
+        valid &= candidate.surfaceInformation.is_valid()
+
+    # 2. Initialize output vertices
+    previous_si = dr.zeros(mi.SurfaceInteraction3f, width)
+    reconnection_si = dr.zeros(mi.SurfaceInteraction3f, width)
+    reached_reconnection = dr.zeros(mi.Bool, width)
+
+    # 3. Replay the path prefix
+    for i in range(max_k - 1):
+
+        # Stop before xk when reconstructing a stored candidate
+        if use_stored_xk:
+            trace = valid & (k > i + 2)
+        else:
+            trace = valid & (k >= i + 2)
+
+        # Sample the current vertex BSDF
+        bsdf = current_si.bsdf(current_ray)
+        sample1 = path_sampler.next_float(mi.Float, trace)
+        sample2 = mi.Point2f(path_sampler.next_float(mi.Float, trace), path_sampler.next_float(mi.Float, trace))
+        bs, _ = bsdf.sample(bsdf_ctx, current_si, sample1, sample2, trace)
+
+        # Trace the next ray
+        valid_sample = trace & (bs.pdf > 0.0) & dr.isfinite(bs.pdf)
+        next_ray = current_si.spawn_ray(current_si.to_world(bs.wo))
+        next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=valid_sample)
+        valid_step = valid_sample & next_si.is_valid()
+
+        # Determine whether we reached the requested reconnection vertex
+        continue_path = valid_step & (k > i + 2)
+
+        if not use_stored_xk:
+            reconnect = valid_step & (k == i + 2)
+            previous_si = dr.select(reconnect, current_si, previous_si)
+            reconnection_si = dr.select(reconnect, next_si, reconnection_si)
+            reached_reconnection |= reconnect
+
+        # Update validity
+        valid &= ~trace | valid_step
+
+        # Advance only the lanes that still need more vertices
+        current_si = dr.select(continue_path, next_si, current_si)
+        current_ray = dr.select(continue_path, next_ray, current_ray)
+
+    # 4. Recover the preserved reconnection vertex if requested
+    if use_stored_xk:
+        previous_si = current_si
+        reconnection_si, valid_xk = reconstruct_reconnection_vertex(scene=scene, current_si=previous_si, candidate=candidate, active=valid)
+        valid &= valid_xk
+    else:
+        valid &= reached_reconnection
+
+    # 5. Validate output
+    valid &= previous_si.is_valid() & reconnection_si.is_valid()
+
+    return previous_si, reconnection_si, valid
 
 
 def reconnection_jacobian(source_vertex: mi.Point3f, target_vertex: mi.Point3f, reconnection_vertex: mi.Point3f, reconnection_normal: mi.Normal3f, active: mi.Mask) -> mi.Float:
@@ -815,10 +875,12 @@ def combine_reservoirs(sampler: mi.Sampler, active: mi.Mask, *reservoir_data: tu
     # The output represents all combined source proposals
     s.M = M_total
 
-    # Generalized RIS contribution weight: Equation (22)
-    valid_output = active & (s.w_sum > 0.0) & (selected_p_hat > 0.0) & dr.isfinite(s.w_sum)
-    safe_p_hat = dr.select(valid_output, selected_p_hat, 1.0)
-    s.W = dr.select(valid_output, s.w_sum / safe_p_hat, 0.0)
+    # This compensates for finalize() dividing by M_total.
+    valid_output = active & (M_total > 0.0) & (selected_p_hat > 0.0)
+    s.w_sum = dr.select(valid_output, s.w_sum * M_total, 0.0)
+
+    # All 1/M normalization happens in finalize()
+    s.finalize(p_hat_selected=selected_p_hat, active=valid_output)
 
     return s
 
