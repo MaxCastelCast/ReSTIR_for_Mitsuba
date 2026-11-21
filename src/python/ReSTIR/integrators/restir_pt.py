@@ -352,9 +352,9 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             short_path_radiance += dr.select(valid_xk, prefix_throughput * Le_xk / self.initial_path_count, mi.Spectrum(0.0))
 
             # Trace postfix starting at xk
-            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, sampler=path_sampler, active=valid_xk, max_depth=PATH_LENGTH - k)
+            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, sampler=path_sampler, k= mi.UInt32(2),  active=valid_xk, max_depth=PATH_LENGTH - k)
 
-            # Evaluate BSDF at xk for the sampled outgoing direction
+            # Evaluate BSDF at xk for the sampled outgoing direction    
             bsdf_xk = xk.bsdf(ray_to_xk)
             wo_local = xk.to_local(outgoing_direction)
             bsdf_val, bsdf_pdf = bsdf_xk.eval_pdf(bsdf_ctx, xk, wo_local, valid_xk)
@@ -410,7 +410,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         # If the shift mapping is not successful, we cannot use the previous sample for temporal reuse and we keep the current sample as is
         temporal_primary_ray = previous_x1_geometry.primary_ray
         current_primary_ray = mi.Ray3f(ray)
-        J, p_hat_temporal, target_bsdf_pdf, valid_shift_mapping = shift_mapping(scene, temporal_primary_ray, initial_reservoir, current_primary_ray, previous_reservoir,previous_index, sampler,  active_history)
+        J, p_hat_temporal, target_bsdf_pdf, valid_shift_mapping = shift_mapping(scene, temporal_primary_ray, previous_reservoir, current_primary_ray, initial_reservoir,previous_index, sampler,  active_history)
 
 
         # Current strategy evaluated at the freshly generated initial candidate
@@ -437,12 +437,12 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         previous_reservoir.select.J = J
 
         # Compute the target radiance function of both the initial function and the target function
-        initial_x2, valid_initial = reconstruct_initial_reconnection(scene=scene, current_si=si, current_ray=current_primary_ray, candidate=initial_reservoir.select, active=active)
-        initial_p_hat = eval_p_hat(current_si=si, reconnection_si=initial_x2, candidate=initial_reservoir.select, bsdf_ctx=mi.BSDFContext(), active=valid_initial)
+        initial_p_hat = eval_p_hat(scene=scene, primary_ray=mi.Ray3f(ray), candidate=initial_reservoir.select, max_k=PATH_LENGTH, bsdf_ctx=mi.BSDFContext(), active=active & (initial_reservoir.W > 0.0), x1=si)
+        valid_initial = initial_p_hat > 0.0
         temporal_p_hat = p_hat_temporal
 
         # Create the reservoir n-uples for the reservoir combination phase
-        initial_reservoir_tuple = (initial_reservoir, mis_initial, initial_p_hat, 1, active)
+        initial_reservoir_tuple = (initial_reservoir, mis_initial, initial_p_hat, 1, valid_initial)
         temporal_reservoir_tuple = (previous_reservoir, mis_temporal, temporal_p_hat, J, valid_shift_mapping)
 
         # Merge this reservoir with the current reservoir
@@ -458,9 +458,8 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         current_primary_ray = mi.Ray3f(ray)
 
         # 1. Evaluate the current candidate
-        current_xk, valid_current = reconstruct_reconnection_vertex(scene=scene, current_si=si, candidate=initial_reservoir.select, active=active)
-        current_p_hat = eval_p_hat(current_si=si, reconnection_si=current_xk, candidate=initial_reservoir.select, bsdf_ctx=bsdf_ctx, active=valid_current)
-        valid_current &= (initial_reservoir.W > 0.0) & (current_p_hat > 0.0) & dr.isfinite(current_p_hat)
+        current_p_hat = eval_p_hat(scene=scene, primary_ray=current_primary_ray, candidate=initial_reservoir.select, max_k=PATH_LENGTH, bsdf_ctx=bsdf_ctx, active=active & (initial_reservoir.W > 0.0), x1=si)
+        valid_current = (active & (initial_reservoir.W > 0.0) & (current_p_hat > 0.0) & dr.isfinite(current_p_hat))
 
         # Each entry contains:
         # reservoir, primary_ray, p_hat, J, strategy_enabled, candidate_valid
@@ -485,7 +484,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             valid_candidate_source = strategy_enabled & (neighbor_reservoir.W > 0.0)
 
             # Shift the selected candidate
-            J, p_hat_spatial, target_bsdf_pdf, valid_shift = shift_mapping(scene, neighbor_primary_ray, initial_reservoir, current_primary_ray, neighbor_reservoir, neighbor_index, sampler, valid_candidate_source)
+            J, p_hat_spatial, target_bsdf_pdf, valid_shift = shift_mapping(scene, neighbor_primary_ray, neighbor_reservoir, current_primary_ray, initial_reservoir, neighbor_index, sampler, valid_candidate_source)
 
             valid_shift &= (J > 0.0) & dr.isfinite(J)
             valid_shift &= (p_hat_spatial > 0.0) & dr.isfinite(p_hat_spatial)
@@ -532,17 +531,18 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         # 2. Retrieve selected candidate
         selected_candidate = reservoir.select
+        primary_ray = mi.Ray3f(ray)
 
-        # 3. Reconstruct preserved reconnection vertex
-        x2, valid_reconnection = reconstruct_reconnection_vertex(scene=scene, current_si=si, candidate=selected_candidate, active=active)
+        # 3. Replay prefix and reconstruct preserved reconnection vertex xk
+        previous_si, xk, _, _, valid_reconnection = replay_path_to_reconnection(scene=scene, primary_ray=primary_ray, path_seed=selected_candidate.seed, k=selected_candidate.k, max_k=PATH_LENGTH, active=active, x1=si, candidate=selected_candidate, use_stored_xk=True)
 
-        # 4. Check visibility from current x1 to x2
-        shadow_ray = si.spawn_ray_to(x2.p)
-        occluded = scene.ray_test(shadow_ray,active=valid_reconnection)
+        # 4. Check visibility between y(k-1) and xk
+        shadow_ray = previous_si.spawn_ray_to(xk.p)
+        occluded = scene.ray_test(shadow_ray, active=valid_reconnection)
         valid_reconnection &= ~occluded
 
-        # 5. Evaluate selected candidate's target
-        target_spectrum = eval_p_hat_spectrum(current_si=si, reconnection_si=x2, candidate=selected_candidate, bsdf_ctx=bsdf_ctx, active=valid_reconnection)
+        # 5. Evaluate complete target spectrum (including prefix throughput)
+        target_spectrum = eval_p_hat_spectrum(scene=scene, primary_ray=primary_ray, candidate=selected_candidate, max_k=PATH_LENGTH, bsdf_ctx=bsdf_ctx, active=valid_reconnection, x1=si)
 
         # 6. Apply reservoir contribution weight
         result += dr.select(valid_reconnection, target_spectrum * reservoir.W, mi.Spectrum(0.0))

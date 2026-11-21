@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
-MAX_PATH_LENGTH = 2
+MAX_PATH_LENGTH = 8
 
 SHIFT_MAPPING_DISTANCE_THRESHOLD = 1e-3
 
@@ -230,7 +230,7 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
     dr.scatter(previous.W, current.W, index, active=active)
 
 
-def trace_prefix_throughput(scene: mi.Scene, sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, k: int, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple[mi.Spectrum, mi.Float, mi.Ray3f, mi.Spectrum, mi.Mask]:
+def trace_prefix_throughput(scene: mi.Scene, sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, k: mi.UInt32, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple[mi.Spectrum, mi.Float, mi.Ray3f, mi.Spectrum, mi.Mask]:
     """
     Trace a path prefix from x1 through x(k-1), then sample
     the outgoing ray toward xk.
@@ -243,18 +243,13 @@ def trace_prefix_throughput(scene: mi.Scene, sampler: dr.llvm.ad.PCG32 | dr.cuda
         valid: Mask indicating successful prefix sampling (does not guarantee that the ray hits xk).
     """
 
-    if k < 2:
-        raise ValueError("Reconnection index k must be >= 2.")
-
-    if k > max_depth:
-        raise ValueError("Reconnection index exceeds max_depth.")
-
     # 1. Initialize the first surface interaction
     if x1 is None:
         x1 = scene.ray_intersect(ray_x0, active=active)
 
-    valid = active & x1.is_valid()
     width = dr.width(ray_x0)
+    valid = active & x1.is_valid()
+    valid &= (k >= 2) & (k <= max_depth)
 
     # 2. Initialize prefix information
     prefix_throughput = dr.full(mi.Spectrum, 1.0, width)
@@ -264,97 +259,135 @@ def trace_prefix_throughput(scene: mi.Scene, sampler: dr.llvm.ad.PCG32 | dr.cuda
 
     x_current = x1
     current_ray = mi.Ray3f(ray_x0)
+    ray_to_xk = mi.Ray3f(ray_x0)
 
     # 3. Trace vertices x1,...,x(k-1)
-    for i in range(k - 1):
+    for i in range(max_depth - 1):
+
+        # Only lanes that have not reached their final prefix vertex
+        trace = valid & (k >= i + 2)
 
         # Accumulate emission at the current prefix vertex
-        emitter = x_current.emitter(scene, valid)
-        Le = emitter.eval(x_current, valid)
-        prefix_radiance += dr.select(valid, prefix_throughput * Le, mi.Spectrum(0.0))
+        emitter = x_current.emitter(scene, trace)
+        Le = emitter.eval(x_current, trace)
+        prefix_radiance += dr.select(trace, prefix_throughput * Le, mi.Spectrum(0.0))
 
         # Retrieve BSDF at the current vertex
         bsdf_xi = x_current.bsdf(current_ray)
 
         # Sample BSDF direction
-        sample1 = sampler.next_float(mi.Float, valid)
-        sample2 = mi.Point2f(sampler.next_float(mi.Float, valid), sampler.next_float(mi.Float, valid))
-        bs, bsdf_weight = bsdf_xi.sample(bsdf_ctx, x_current, sample1, sample2, valid)
+        sample1 = sampler.next_float(mi.Float, trace)
+        sample2 = mi.Point2f(sampler.next_float(mi.Float, trace), sampler.next_float(mi.Float, trace))
+        bs, bsdf_weight = bsdf_xi.sample(bsdf_ctx, x_current, sample1, sample2, trace)
 
         # Check whether sampling succeeded
-        valid &= (bs.pdf > 0.0) & dr.isfinite(bs.pdf)
+        valid_sample = trace & (bs.pdf > 0.0) & dr.isfinite(bs.pdf)
 
         # Convert BSDF weight to world polarization basis
         bsdf_weight = x_current.to_world_mueller(bsdf_weight, -bs.wo, x_current.wi)
 
         # Accumulate BSDF / PDF throughput
-        prefix_throughput = dr.select(valid, prefix_throughput * bsdf_weight, mi.Spectrum(0.0))
+        prefix_throughput = dr.select(trace, dr.select(valid_sample, prefix_throughput * bsdf_weight, mi.Spectrum(0.0)), prefix_throughput)
 
         # Generate ray toward the next vertex
         wo_world = x_current.to_world(bs.wo)
         next_ray = x_current.spawn_ray(wo_world)
 
-        # 4. Special case: last prefix vertex x(k-1)
-        if i == k - 2:
-            xk_pdf = dr.select(valid, bs.pdf, 0.0)
-            current_ray = next_ray
-            break
+        # 4. Identify lanes that have reached x(k-1)
+        reached_last_vertex = valid_sample & (k == i + 2)
 
-        # 5. Otherwise, advance to the next prefix vertex
-        x_current = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=valid)
-        valid &= x_current.is_valid()
-        current_ray = next_ray
+        # Save the final BSDF PDF
+        xk_pdf = dr.select(reached_last_vertex, bs.pdf, xk_pdf)
 
-    # 6. Return reconstructed prefix information
-    return prefix_throughput, xk_pdf, current_ray, prefix_radiance, valid
+        # Save the final ray toward xk
+        ray_to_xk = dr.select(reached_last_vertex, next_ray, ray_to_xk)
+
+        # 5. Continue only for lanes that need another prefix vertex
+        continue_path = valid_sample & (k > i + 2)
+
+        # Intersect the next prefix vertex
+        next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=continue_path)
+
+        # Validate the next intersection
+        valid_next = continue_path & next_si.is_valid()
+
+        # Update validity only for lanes that were tracing
+        valid &= ~trace | (valid_sample & ((k == i + 2) | valid_next))
+
+        # Advance only unfinished paths
+        x_current = dr.select(valid_next, next_si, x_current)
+        current_ray = dr.select(valid_next, next_ray, current_ray)
+
+    # 6. Mask invalid final outputs
+    prefix_throughput = dr.select(valid, prefix_throughput, mi.Spectrum(0.0))
+    xk_pdf = dr.select(valid, xk_pdf, 0.0)
+
+    return prefix_throughput, xk_pdf, ray_to_xk, prefix_radiance, valid
 
 
-# Only path tracing contribution for now, no NEE
-def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk: mi.RayDifferential3f, sampler: mi.Sampler, active: mi.Mask, max_depth: int = 5) -> tuple[mi.Spectrum, mi.Vector3f]:
+def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk: mi.RayDifferential3f, sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5) -> tuple[mi.Spectrum, mi.Vector3f]:
 
-    # Intitialize accumulated radiance and throughput
-    L = dr.zeros(mi.Spectrum, dr.width(xk.p))
-    throughput = mi.Spectrum(1.0)
-
-    # Store the outgoing direction sampled at xk
-    outgoing_direction = dr.zeros(mi.Vector3f, dr.width(xk.p))
+    # 1. Initialize accumulated radiance and throughput
+    width = dr.width(xk.p)
+    L = dr.zeros(mi.Spectrum, width)
+    throughput = dr.full(mi.Spectrum, 1.0, width)
+    outgoing_direction = dr.zeros(mi.Vector3f, width)
 
     si = xk
-    ray = ray_xk
-    active_path = active & xk.is_valid()
+    ray = mi.Ray3f(ray_xk)
     bsdf_ctx = mi.BSDFContext()
 
-    for depth in range(max_depth):
+    # Validate the reconnection index
+    active_path = active & xk.is_valid() & (k >= 2) & (k < max_depth)
+
+    # 2. Trace the suffix starting at xk
+    for depth in range(max_depth - 2):
+
+        # Only lanes with remaining suffix bounces participate
+        trace = active_path & (k + depth < max_depth)
 
         # Sample the BSDF at the current vertex
         bsdf = si.bsdf(ray)
-        sample1 = sampler.next_float(mi.Float, active_path)
-        sample2 = mi.Point2f(sampler.next_float(mi.Float, active_path), sampler.next_float(mi.Float, active_path))
+        sample1 = sampler.next_float(mi.Float, trace)
+        sample2 = mi.Point2f(sampler.next_float(mi.Float, trace), sampler.next_float(mi.Float, trace))
+        bs, bsdf_weight = bsdf.sample(bsdf_ctx, si, sample1, sample2, trace)
 
-        bs, bsdf_weight = bsdf.sample(bsdf_ctx, si, sample1, sample2, active_path)
-        active_bsdf = active_path & (bs.pdf > 0.0)
+        # Check whether BSDF sampling succeeded
+        valid_sample = trace & (bs.pdf > 0.0) & dr.isfinite(bs.pdf)
+
+        # Convert BSDF weight to world polarization basis
         bsdf_weight = si.to_world_mueller(bsdf_weight, -bs.wo, si.wi)
 
+        # Compute outgoing direction
         wo_world = si.to_world(bs.wo)
 
-        # Store the direction sampled at xk to return it to the caller
+        # Store the outgoing direction sampled at xk
         if depth == 0:
-            outgoing_direction = dr.select(active_bsdf, wo_world, outgoing_direction)
+            outgoing_direction = dr.select(valid_sample, wo_world, outgoing_direction)
 
         # Update throughput, excluding the BSDF at xk
         if depth > 0:
-            throughput *= bsdf_weight
+            throughput = dr.select(valid_sample, throughput * bsdf_weight, throughput)
 
         # Trace the next ray
-        ray = si.spawn_ray(wo_world)
-        si = scene.ray_intersect(ray, ray_flags=mi.RayFlags.All, coherent=False, active=active_bsdf)
-        active_path = active_bsdf & si.is_valid()
+        next_ray = si.spawn_ray(wo_world)
+        next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=valid_sample)
+        valid_next = valid_sample & next_si.is_valid()
 
         # Evaluate emission at the newly reached vertex
-        emitter = si.emitter(scene, active_path)
-        Le = emitter.eval(si, active_path)
+        emitter = next_si.emitter(scene, valid_next)
+        Le = emitter.eval(next_si, valid_next)
+        L += dr.select(valid_next, throughput * Le, mi.Spectrum(0.0))
 
-        L += dr.select(active_path, throughput * Le, 0.0)
+        # Continue only for lanes with remaining suffix bounces
+        continue_path = valid_next & (k + depth + 1 < max_depth)
+
+        # Preserve completed lanes
+        si = dr.select(continue_path, next_si, si)
+        ray = dr.select(continue_path, next_ray, ray)
+
+        # Terminate unsuccessful paths
+        active_path = continue_path
 
     return L, outgoing_direction
 
@@ -382,59 +415,42 @@ def create_path_sampler(path_seed: mi.UInt32, width: int) -> dr.llvm.ad.PCG32 | 
     return rng
 
 
-def eval_p_hat_spectrum(current_si: mi.SurfaceInteraction3f, reconnection_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf_ctx: mi.BSDFContext, active: mi.Mask) -> mi.Spectrum:
+def eval_p_hat_spectrum(scene: mi.Scene, primary_ray: mi.Ray3f, candidate: Sample, max_k: int, bsdf_ctx: mi.BSDFContext, active: mi.Mask, x1: mi.SurfaceInteraction3f | None = None) -> mi.Spectrum:
 
-    """
-    Evaluate the unnormalized target contribution of a
-    ReSTIR PT candidate.
+     # 1. Replay the prefix and reconstruct the preserved xk
+    previous_si, reconnection_si, prefix_throughput, _, valid = replay_path_to_reconnection(scene=scene, primary_ray=primary_ray, path_seed=candidate.seed, k=candidate.k, max_k=max_k, active=active, x1=x1, candidate=candidate, use_stored_xk=True)
 
-    Assumes:
-      - current_si is the vertex immediately before reconnection.
-      - reconnection_si is the preserved vertex x_k.
-      - reconnection_si.wi corresponds to the CURRENT connection.
-      - candidate.incomingRadiance stores the suffix radiance
-        excluding the BSDF weight at x_k.
-    """
-
-    valid = active & current_si.is_valid() & reconnection_si.is_valid()
-
-    # 1. Evaluate BSDF before reconnection
-    # Direction from current vertex to x_k
-    delta = reconnection_si.p - current_si.p
+    # 2. Evaluate BSDF at y(k-1) toward preserved xk
+    delta = reconnection_si.p - previous_si.p
     dist2 = dr.squared_norm(delta)
-    valid &= dist2 > 0.0
+    valid &= (dist2 > 0.0) & dr.isfinite(dist2)
     safe_dist2 = dr.select(valid, dist2, 1.0)
     wo_world = delta * dr.rsqrt(safe_dist2)
-    wo_local = current_si.to_local(wo_world)
-    bsdf_current = current_si.bsdf()
-    bsdf_val_current = bsdf_current.eval(bsdf_ctx, current_si, wo_local, valid)
+    wo_local = previous_si.to_local(wo_world)
 
-    # 2. Evaluate BSDF at reconnection vertex
-    # Outgoing direction toward preserved suffix
-    wo_reconnection_local = reconnection_si.to_local(candidate.outgoingDirection)
-    bsdf_reconnection = reconnection_si.bsdf()
-    bsdf_val_reconnection, bsdf_pdf_reconnection = bsdf_reconnection.eval_pdf(bsdf_ctx, reconnection_si, wo_reconnection_local, valid)
-    valid &= bsdf_pdf_reconnection > 0.0
-    safe_pdf = dr.select(valid,bsdf_pdf_reconnection, 1.0)
+    bsdf_previous = previous_si.bsdf()
+    bsdf_val_previous = bsdf_previous.eval(bsdf_ctx, previous_si, wo_local, valid)
 
-    # Reconnection BSDF sampling weight
-    weight_reconnection = dr.select(valid, bsdf_val_reconnection / safe_pdf, 0.0)
+    # 3. Evaluate BSDF at xk for the preserved outgoing direction
+    wo_xk_local = reconnection_si.to_local(candidate.outgoingDirection)
+    bsdf_xk = reconnection_si.bsdf()
+    bsdf_val_xk, bsdf_pdf_xk = bsdf_xk.eval_pdf(bsdf_ctx, reconnection_si, wo_xk_local, valid)
+    valid &= (bsdf_pdf_xk > 0.0) & dr.isfinite(bsdf_pdf_xk)
+    safe_pdf_xk = dr.select(valid, bsdf_pdf_xk, 1.0)
+    weight_xk = dr.select(valid, bsdf_val_xk / safe_pdf_xk, mi.Spectrum(0.0))
 
-    # 3. Evaluate target contribution
-    target_spectrum = bsdf_val_current * weight_reconnection * candidate.incomingRadiance
+    # 4. Compute the complete target contribution
+    target_spectrum = prefix_throughput * bsdf_val_previous * weight_xk * candidate.incomingRadiance
 
     return dr.select(valid, target_spectrum, mi.Spectrum(0.0))
 
 
-def eval_p_hat(current_si: mi.SurfaceInteraction3f, reconnection_si: mi.SurfaceInteraction3f, candidate: Sample, bsdf_ctx: mi.BSDFContext, active: mi.Mask) -> mi.Float:
-    # Evaluate p_hat_spectrum to get the spectrum
-    p_hat_spectrum = eval_p_hat_spectrum(current_si, reconnection_si, candidate, bsdf_ctx, active)
+def eval_p_hat(scene: mi.Scene, primary_ray: mi.Ray3f, candidate: Sample, max_k: int, bsdf_ctx: mi.BSDFContext, active: mi.Mask, x1: mi.SurfaceInteraction3f | None = None) -> mi.Float:
 
-    # Get a float value with the luminance of the spectrum
-    p_hat = mi.luminance(mi.unpolarized_spectrum(p_hat_spectrum), current_si.wavelengths, active)
+    target_spectrum = eval_p_hat_spectrum(scene=scene, primary_ray=primary_ray, candidate=candidate, max_k=max_k, bsdf_ctx=bsdf_ctx, active=active, x1=x1)
+    p_hat = mi.luminance( mi.unpolarized_spectrum(target_spectrum), primary_ray.wavelengths, active)
 
     return dr.select(active & dr.isfinite(p_hat) & (p_hat > 0.0), p_hat, 0.0)
-
 
 # Get the indexes of the previous frame reservoirs that correspond to the current frame pixels
 def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor, current_sensor: mi.Sensor, sampler: mi.Sampler,  film_width: int, film_height: int, pixel_index: mi.UInt32, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
@@ -494,69 +510,66 @@ def eval_selected_neighbor(sampler: mi.Sampler,  film_width: int, film_height: i
 
     return neighbor_index, valid_neighbor
 
-def shift_mapping(scene: mi.Scene, temporal_preliminary_ray: mi.Ray3f, initial_reservoir: Reservoir, current_preliminary_ray: mi.Ray3f, previous_reservoir: Reservoir, previous_index: mi.UInt32, current_sampler: mi.Sampler, active: mi.Mask) -> tuple[mi.Float, mi.Float, mi.Float, mi.Mask]:
+def shift_mapping(scene: mi.Scene, temporal_preliminary_ray: mi.Ray3f, temporal_reservoir: Reservoir, current_preliminary_ray: mi.Ray3f, current_reservoir: Reservoir, previous_index: mi.UInt32, current_sampler: mi.Sampler, active: mi.Mask) -> tuple[mi.Float, mi.Float, mi.Float, mi.Mask]:
     bsdf_ctx = mi.BSDFContext()
-    candidate = previous_reservoir.select
+    candidate = temporal_reservoir.select
+    width = dr.width(current_preliminary_ray)
 
-    # 1. Reconstruct the previous and current first vertices
-    x1 = scene.ray_intersect(temporal_preliminary_ray, ray_flags=mi.RayFlags.All, coherent=False, active=active)
-    y1 = scene.ray_intersect(current_preliminary_ray, ray_flags=mi.RayFlags.All, coherent=False, active=active)
-    valid = active & x1.is_valid() & y1.is_valid() & (candidate.k == 2)
+    # 1. Construct the needed vertices for our shift mappign
+    # TO OPTIMIZE : can use geometric buffer of x1 for the path x
+    xk_previous, xk, _, _, valid_replay_xk  = replay_path_to_reconnection(scene=scene, primary_ray=temporal_preliminary_ray, path_seed=candidate.seed, k=candidate.k, max_k=MAX_PATH_LENGTH, active=active, x1 = None, candidate= candidate, use_stored_xk=True)
+    # TODO : is the path "y" using the right seed for replay ? 
+    yk_previous, _, yk_prefix_throughput, prefix_path_pdf_y, valid_replay_yk = replay_path_to_reconnection(scene=scene, primary_ray=current_preliminary_ray, path_seed=candidate.seed, k=candidate.k, max_k=MAX_PATH_LENGTH, active=active, x1 = None, candidate= candidate, use_stored_xk=True)
+    valid = active & valid_replay_xk & valid_replay_yk & xk_previous.is_valid() & xk.is_valid() & yk_previous.is_valid()
 
-    # 2. Reconstruct the preserved reconnection vertex x2
-    x2, valid_x2 = reconstruct_reconnection_vertex(scene=scene, current_si=x1, candidate=candidate, active=valid)
-    valid &= valid_x2
+    # 2. Verify that the shift mapping is feasible
+    valid = shift_mapping_criterions(scene=scene, yk_previous=yk_previous, xk_previous=xk_previous, xk=xk, active=valid)
 
-    # 3. Verify that the shift mapping is feasible
-    valid = shift_mapping_criterions(scene=scene, yk_previous=y1, xk_previous=x1, xk=x2, active=valid)
-
-    # 4. Compute the reconnection Jacobian
-    J = reconnection_jacobian(source_vertex=x1.p, target_vertex=y1.p, reconnection_vertex=x2.p, reconnection_normal=x2.n, active=valid)
+    # 3. Compute the reconnection Jacobian
+    J = reconnection_jacobian(source_vertex=xk_previous.p, target_vertex=yk_previous.p, reconnection_vertex=xk.p, reconnection_normal=xk.n, active=valid)
     valid &= dr.isfinite(J) & (J > 0.0)
 
-    # 5. Evaluate the new connection y1 -> x2
-    delta = x2.p - y1.p
+
+    # 4. Evaluate the new connection yk_previous -> xk
+    delta = xk.p - yk_previous.p
     dist2 = dr.squared_norm(delta)
     valid &= dist2 > 0.0
     safe_dist2 = dr.select(valid, dist2, 1.0)
     wo_world = delta * dr.rsqrt(safe_dist2)
-    wo_local = y1.to_local(wo_world)
-    bsdf_y1 = y1.bsdf(current_preliminary_ray)
-    bsdf_val_y1, target_bsdf_pdf = bsdf_y1.eval_pdf(bsdf_ctx, y1, wo_local, valid)
+    wo_local = yk_previous.to_local(wo_world)
+    bsdf_yk = yk_previous.bsdf()
+    bsdf_val_yk_previous, target_bsdf_pdf = bsdf_yk.eval_pdf(bsdf_ctx, yk_previous, wo_local, valid)
     valid &= dr.isfinite(target_bsdf_pdf) & (target_bsdf_pdf > 0.0)
-    safe_pdf_y1 = dr.select(valid, target_bsdf_pdf, 1.0)
 
-    # Sampling throughput of the new first connection
-    weight_y1 = dr.select(valid, bsdf_val_y1 / safe_pdf_y1, mi.Spectrum(0.0))
-
-    # 6. Update the incoming direction at x2
-    x2_shifted = mi.SurfaceInteraction3f(x2)
-    delta_back = y1.p - x2.p
+    # 5. Update the incoming direction at xk
+    xk_shifted = mi.SurfaceInteraction3f(xk)
+    delta_back = yk_previous.p - xk.p
     dist2_back = dr.squared_norm(delta_back)
     valid &= dist2_back > 0.0
     safe_dist2_back = dr.select(valid, dist2_back, 1.0)
     wi_world = delta_back * dr.rsqrt(safe_dist2_back)
-    x2_shifted.wi = x2_shifted.to_local(wi_world)
+    xk_shifted.wi = xk_shifted.to_local(wi_world)
 
-    # 7. Evaluate the preserved suffix at x2
-    wo_x2_local = x2_shifted.to_local(candidate.outgoingDirection)
-    bsdf_x2 = x2_shifted.bsdf()
-    bsdf_val_x2, bsdf_pdf_x2 = bsdf_x2.eval_pdf(bsdf_ctx, x2_shifted, wo_x2_local, valid)
+    # 6. Evaluate the preserved suffix at xk
+    wo_xk_local = xk_shifted.to_local(candidate.outgoingDirection)
+    bsdf_xk = xk_shifted.bsdf()
+    bsdf_val_xk, bsdf_pdf_x2 = bsdf_xk.eval_pdf(bsdf_ctx, xk_shifted, wo_xk_local, valid)
     valid &= dr.isfinite(bsdf_pdf_x2) & (bsdf_pdf_x2 > 0.0)
     safe_pdf_x2 = dr.select(valid, bsdf_pdf_x2, 1.0)
-    weight_x2 = dr.select(valid, bsdf_val_x2 / safe_pdf_x2, mi.Spectrum(0.0))
+    weight_xk = dr.select(valid, bsdf_val_xk / safe_pdf_x2, mi.Spectrum(0.0))
 
-    # 8. Calculate the target function
-    target_spectrum = bsdf_val_y1 * weight_x2 * candidate.incomingRadiance
-    p_hat_temporal = mi.luminance(mi.unpolarized_spectrum(target_spectrum), y1.wavelengths, valid)
+    # 7. Calculate the target function
+    target_prefix_pdf = target_bsdf_pdf * prefix_path_pdf_y
+    target_spectrum = yk_prefix_throughput * bsdf_val_yk_previous * weight_xk * candidate.incomingRadiance
+    p_hat_temporal = mi.luminance(mi.unpolarized_spectrum(target_spectrum), yk_previous.wavelengths, valid)
     valid &= dr.isfinite(p_hat_temporal) & (p_hat_temporal > 0.0)
 
-    # 9. Mask invalid outputs
+    # 8. Mask invalid outputs
     J = dr.select(valid, J, 0.0)
     p_hat_temporal = dr.select(valid, p_hat_temporal, 0.0)
-    target_bsdf_pdf = dr.select(valid, target_bsdf_pdf, 0.0)
+    target_prefix_pdf = dr.select(valid, target_prefix_pdf, 0.0)
 
-    return J, p_hat_temporal, target_bsdf_pdf, valid
+    return J, p_hat_temporal, target_prefix_pdf, valid
 
 
 def replay_prefix_until_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_seed: mi.UInt32, k: mi.UInt32, max_k: int, active: mi.Mask) -> tuple[mi.SurfaceInteraction3f, mi.Mask]:
@@ -646,11 +659,11 @@ def compute_shifted_pdf_proxy(scene: mi.Scene, source_primary_ray: mi.Ray3f, tar
     valid = active & (candidate.k >= 2) & (candidate.k <= max_k) & candidate.surfaceInformation.is_valid()
 
     # 2. Replay source prefix and reconstruct preserved xk
-    source_previous, source_xk, valid_source = replay_path_to_reconnection(scene=scene, primary_ray=source_primary_ray, path_seed=candidate.seed, k=candidate.k, max_k=max_k, active=valid, candidate=candidate, use_stored_xk=True)
+    source_previous, source_xk, _, _, valid_source = replay_path_to_reconnection(scene=scene, primary_ray=source_primary_ray, path_seed=candidate.seed, k=candidate.k, max_k=max_k, active=valid, candidate=candidate, use_stored_xk=True)
     valid &= valid_source
 
     # 3. Replay target prefix and reconstruct the same preserved xk
-    target_previous, target_xk, valid_target = replay_path_to_reconnection(scene=scene, primary_ray=target_primary_ray, path_seed=candidate.seed, k=candidate.k, max_k=max_k, active=valid, candidate=candidate, use_stored_xk=True)
+    target_previous, target_xk, _, target_prefix_pdf, valid_target = replay_path_to_reconnection(scene=scene, primary_ray=target_primary_ray, path_seed=candidate.seed, k=candidate.k, max_k=max_k, active=valid, candidate=candidate, use_stored_xk=True)
     valid &= valid_target
 
     # 4. Validate source and target reconnection compatibility
@@ -667,6 +680,7 @@ def compute_shifted_pdf_proxy(scene: mi.Scene, source_primary_ray: mi.Ray3f, tar
     source_pdf = source_bsdf.pdf(bsdf_ctx, source_previous, wo_local, valid)
     valid &= (source_pdf > 0.0) & dr.isfinite(source_pdf)
 
+
     # 6. Check visibility of the hypothetical source connection
     source_connection_ray = source_previous.spawn_ray_to(source_xk.p)
     source_occluded = scene.ray_test(source_connection_ray, active=valid)
@@ -677,16 +691,18 @@ def compute_shifted_pdf_proxy(scene: mi.Scene, source_primary_ray: mi.Ray3f, tar
     valid &= (J > 0.0) & dr.isfinite(J)
 
     # 8. Transform source connection PDF into target domain
+    valid &= (target_prefix_pdf > 0.0) & dr.isfinite(target_prefix_pdf)
     safe_J = dr.select(valid, J, 1.0)
-    proxy_pdf = dr.select(valid, source_pdf / safe_J, 0.0)
+    proxy_pdf = dr.select(valid, target_prefix_pdf * source_pdf / safe_J, 0.0)
 
-    # 9. Mask invalid results
+    # 9. Mask invalid outputs
+    valid &= dr.isfinite(proxy_pdf)
     J = dr.select(valid, J, 0.0)
-    proxy_pdf = dr.select(valid & dr.isfinite(proxy_pdf), proxy_pdf, 0.0)
+    proxy_pdf = dr.select(valid, proxy_pdf, 0.0)
 
     return proxy_pdf, J, valid
 
-def replay_path_to_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_seed: mi.UInt32, k: mi.UInt32, max_k: int, active: mi.Mask, x1: mi.SurfaceInteraction3f | None = None, candidate: Sample | None = None, use_stored_xk: bool = False) -> tuple[mi.SurfaceInteraction3f, mi.SurfaceInteraction3f, mi.Mask]:
+def replay_path_to_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_seed: mi.UInt32, k: mi.UInt32, max_k: int, active: mi.Mask, x1: mi.SurfaceInteraction3f | None = None, candidate: Sample | None = None, use_stored_xk: bool = False) -> tuple[mi.SurfaceInteraction3f, mi.SurfaceInteraction3f, mi.Spectrum, mi.Float, mi.Mask]:
     
     if max_k < 2:
         raise ValueError("max_k must be >= 2.")
@@ -697,6 +713,8 @@ def replay_path_to_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_see
     width = dr.width(primary_ray)
     bsdf_ctx = mi.BSDFContext()
     path_sampler = create_path_sampler(path_seed, width)
+    prefix_throughput = dr.full(mi.Spectrum, 1.0, width)
+    prefix_pdf = dr.full(mi.Float, 1.0, width)
 
     # 1. Initialize x1
     current_ray = mi.Ray3f(primary_ray)
@@ -728,7 +746,8 @@ def replay_path_to_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_see
         bsdf = current_si.bsdf(current_ray)
         sample1 = path_sampler.next_float(mi.Float, trace)
         sample2 = mi.Point2f(path_sampler.next_float(mi.Float, trace), path_sampler.next_float(mi.Float, trace))
-        bs, _ = bsdf.sample(bsdf_ctx, current_si, sample1, sample2, trace)
+        bs, bsdf_weight= bsdf.sample(bsdf_ctx, current_si, sample1, sample2, trace)
+        bsdf_weight = current_si.to_world_mueller(bsdf_weight, -bs.wo, current_si.wi)
 
         # Trace the next ray
         valid_sample = trace & (bs.pdf > 0.0) & dr.isfinite(bs.pdf)
@@ -738,6 +757,10 @@ def replay_path_to_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_see
 
         # Determine whether we reached the requested reconnection vertex
         continue_path = valid_step & (k > i + 2)
+
+        # Accumulate prefix throughput
+        prefix_throughput = dr.select(continue_path, prefix_throughput * bsdf_weight, prefix_throughput)
+        prefix_pdf = dr.select(continue_path, prefix_pdf * bs.pdf, prefix_pdf)
 
         if not use_stored_xk:
             reconnect = valid_step & (k == i + 2)
@@ -763,7 +786,7 @@ def replay_path_to_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_see
     # 5. Validate output
     valid &= previous_si.is_valid() & reconnection_si.is_valid()
 
-    return previous_si, reconnection_si, valid
+    return previous_si, reconnection_si, prefix_throughput, prefix_pdf, valid
 
 
 def reconnection_jacobian(source_vertex: mi.Point3f, target_vertex: mi.Point3f, reconnection_vertex: mi.Point3f, reconnection_normal: mi.Normal3f, active: mi.Mask) -> mi.Float:
@@ -883,44 +906,6 @@ def combine_reservoirs(sampler: mi.Sampler, active: mi.Mask, *reservoir_data: tu
     s.finalize(p_hat_selected=selected_p_hat, active=valid_output)
 
     return s
-
-
-def reconstruct_initial_reconnection(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, current_ray: mi.Ray3f, candidate: Sample, active: mi.Mask) -> tuple[mi.SurfaceInteraction3f, mi.Mask]:
-
-    """
-    Reconstruct x2 of a locally generated candidate.
-
-    Only supports k = 2.
-    """
-
-    width = dr.width(current_si.p)
-    bsdf_ctx = mi.BSDFContext()
-    valid = active & current_si.is_valid()
-
-    # Recreate the sampler used for this candidate
-    path_sampler = create_path_sampler(candidate.seed, width)
-
-    sample1 = path_sampler.next_float(mi.Float, valid)
-    sample2 = mi.Point2f(path_sampler.next_float(mi.Float, valid), path_sampler.next_float(mi.Float, valid))
-
-    # Replay BSDF sampling at x1
-    bsdf = current_si.bsdf(current_ray)
-    bs, _ = bsdf.sample(bsdf_ctx, current_si, sample1, sample2, valid)
-
-    valid &= bs.pdf > 0.0
-
-    # Reconstruct x2
-    ray_to_x2 = current_si.spawn_ray(current_si.to_world(bs.wo))
-    reconnection_si = scene.ray_intersect(ray_to_x2, active=valid)
-    valid &= reconnection_si.is_valid()
-
-    # Verify that replay reached the stored candidate
-    stored_pi = candidate.surfaceInformation
-    replayed_pi = scene.ray_intersect_preliminary(ray_to_x2, active=valid)
-
-    valid &= stored_pi.is_valid() & (replayed_pi.prim_index == stored_pi.prim_index) & (dr.norm(replayed_pi.prim_uv - stored_pi.prim_uv) < 1e-5)
-
-    return reconnection_si, valid
 
 
 def reconstruct_reconnection_vertex(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, candidate: Sample, active: mi.Mask) -> tuple[mi.SurfaceInteraction3f, mi.Mask]:
