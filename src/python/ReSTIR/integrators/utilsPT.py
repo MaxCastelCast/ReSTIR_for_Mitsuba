@@ -248,7 +248,7 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
     dr.scatter(previous.W, current.W, index, active=active)
 
 
-def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple[mi.Spectrum, mi.Float, mi.Ray3f, mi.Spectrum, mi.Mask]:
+def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple[mi.Spectrum, mi.Float, mi.Ray3f, mi.Spectrum, mi.SurfaceInteraction3f, mi.Bool, mi.Mask]:
     """
     Trace a path prefix from x1 through x(k-1), then sample
     the outgoing ray toward xk.
@@ -259,6 +259,7 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
         xk_incoming_ray: Ray from x(k-1) toward xk.
         prefix_radiance: Accumulated emission from x1,...,x(k-1).
         valid: Mask indicating successful prefix sampling (does not guarantee that the ray hits xk).
+        xk_previous: Surface interaction at x(k-1), where the ray toward xk was sampled.
     """
 
     # 1. Initialize the first surface interaction
@@ -278,6 +279,12 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
     x_current = x1
     current_ray = mi.Ray3f(ray_x0)
     ray_to_xk = mi.Ray3f(ray_x0)
+    xk_previous = mi.SurfaceInteraction3f(x1)
+
+    previous_si = mi.SurfaceInteraction3f(x1)
+    previous_bsdf_pdf = dr.zeros(mi.Float, width)
+    previous_delta = dr.zeros(mi.Bool, width)
+    xk_delta = dr.zeros(mi.Bool, width)
 
     # 3. Trace vertices x1,...,x(k-1)
     for i in range(max_depth - 1):
@@ -291,7 +298,31 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
         # Accumulate emission at the current prefix vertex
         emitter = x_current.emitter(scene, trace)
         Le = emitter.eval(x_current, trace)
-        prefix_radiance += dr.select(trace, prefix_throughput * Le, mi.Spectrum(0.0))
+
+        # The first camera intersection does not require MIS
+        mis_bsdf = dr.ones(mi.Float, width)
+
+        # Only vertices reached through BSDF sampling require MIS
+        active_mis = trace & (i > 0) 
+
+        # Construct the direction sample for the previous BSDF connection
+        ds_bsdf = mi.DirectionSample3f(scene, x_current, previous_si)
+
+        # Evaluate the NEE PDF for that connection
+        emitter_pdf = scene.pdf_emitter_direction(previous_si, ds_bsdf, active=active_mis)
+
+        # Compute the BSDF MIS weight
+        mis_previous = mis_weight(previous_bsdf_pdf, emitter_pdf, selected_index=0, power=2)
+
+        # Delta BSDF events cannot be sampled by ordinary NEE
+        mis_previous = dr.select(previous_delta, 1.0, mis_previous)
+
+        # Apply MIS only to vertices after x1
+        mis_bsdf = dr.select(active_mis, mis_previous, 1.0)
+
+        # Accumulate the weighted emission
+        emission_contribution = prefix_throughput * Le * mis_bsdf
+        prefix_radiance += dr.select(trace, emission_contribution, mi.Spectrum(0.0))        
 
         # Next Event Estimation
         sample_nee = mi.Point2f(nee_sampler.next_1d(trace), nee_sampler.next_1d(trace))
@@ -327,14 +358,28 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
         wo_world = x_current.to_world(bs.wo)
         next_ray = x_current.spawn_ray(wo_world)
 
+        # Store the information needed for MIS at the next vertex
+        continue_path = valid_sample & (k > i + 2)
+
+        previous_si = dr.select(continue_path, x_current, previous_si)
+        previous_bsdf_pdf = dr.select(continue_path, bs.pdf, previous_bsdf_pdf)
+        sampled_delta = mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta)
+        previous_delta = dr.select(continue_path, sampled_delta, previous_delta)
+
         # 4. Identify lanes that have reached x(k-1)
         reached_last_vertex = valid_sample & (k == i + 2)
+
+        # Test if this interaction is with a delta surface 
+        xk_delta = dr.select(reached_last_vertex, sampled_delta, xk_delta)
 
         # Save the final BSDF PDF
         xk_pdf = dr.select(reached_last_vertex, bs.pdf, xk_pdf)
 
         # Save the final ray toward xk
         ray_to_xk = dr.select(reached_last_vertex, next_ray, ray_to_xk)
+
+        # Save the vertex xk_previous
+        xk_previous = dr.select(reached_last_vertex, x_current, xk_previous)
 
         # 5. Continue only for lanes that need another prefix vertex
         continue_path = valid_sample & (k > i + 2)
@@ -356,7 +401,7 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
     prefix_throughput = dr.select(valid, prefix_throughput, mi.Spectrum(0.0))
     xk_pdf = dr.select(valid, xk_pdf, 0.0)
 
-    return prefix_throughput, xk_pdf, ray_to_xk, prefix_radiance, valid
+    return prefix_throughput, xk_pdf, ray_to_xk, prefix_radiance, xk_previous, xk_delta, valid
 
 
 def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk: mi.RayDifferential3f, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5) -> tuple[mi.Spectrum, mi.Vector3f]:
@@ -425,7 +470,6 @@ def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk:
         mis_bsdf = mis_weight(bs.pdf, emitter_pdf, selected_index=0, power=2)
         mis_bsdf = dr.select(mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta), 1.0, mis_bsdf)
 
-        # No NEE is performed at xk
         if depth == 0:
             outgoing_direction = wo_world
         else:
@@ -638,7 +682,7 @@ def shift_mapping(scene: mi.Scene, temporal_preliminary_ray: mi.Ray3f, temporal_
     xk_contribution = eval_xk_contribution(xk_shifted, candidate, bsdf_ctx, valid)
 
     # 7. Calculate the target function
-    target_prefix_pdf = prefix_path_pdf_y * target_bsdf_pdf
+    target_reconnection_pdf = target_bsdf_pdf
     target_spectrum = yk_prefix_throughput * bsdf_val_yk_previous * xk_contribution
     p_hat_temporal = mi.luminance(mi.unpolarized_spectrum(target_spectrum), yk_previous.wavelengths, valid)
     valid &= dr.isfinite(p_hat_temporal) & (p_hat_temporal > 0.0)
@@ -646,9 +690,9 @@ def shift_mapping(scene: mi.Scene, temporal_preliminary_ray: mi.Ray3f, temporal_
     # 8. Mask invalid outputs
     J = dr.select(valid, J, 0.0)
     p_hat_temporal = dr.select(valid, p_hat_temporal, 0.0)
-    target_prefix_pdf = dr.select(valid, target_prefix_pdf, 0.0)
+    target_reconnection_pdf = dr.select(valid, target_reconnection_pdf, 0.0)
 
-    return J, p_hat_temporal, target_prefix_pdf, valid
+    return J, p_hat_temporal, target_reconnection_pdf, valid
 
 
 def replay_prefix_until_reconnection(scene: mi.Scene, primary_ray: mi.Ray3f, path_seed: mi.UInt32, k: mi.UInt32, max_k: int, active: mi.Mask) -> tuple[mi.SurfaceInteraction3f, mi.Mask]:
@@ -772,7 +816,7 @@ def compute_shifted_pdf_proxy(scene: mi.Scene, source_primary_ray: mi.Ray3f, tar
     # 8. Transform source connection PDF into target domain
     valid &= (target_prefix_pdf > 0.0) & dr.isfinite(target_prefix_pdf)
     safe_J = dr.select(valid, J, 1.0)
-    proxy_pdf = dr.select(valid, target_prefix_pdf * source_pdf / safe_J, 0.0)
+    proxy_pdf = dr.select(valid, source_pdf / safe_J, 0.0)
 
     # 9. Mask invalid outputs
     valid &= dr.isfinite(proxy_pdf)

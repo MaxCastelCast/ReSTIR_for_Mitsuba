@@ -8,7 +8,7 @@ from utilsPT import *
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
 
-SPATIAL_NEIGHBOR_COUNT = 1
+SPATIAL_NEIGHBOR_COUNT = 2
 SPATIAL_NEIGHBOR_RADIUS = 10
 
 # PATH_LENGTH : The total number of edges (counting the one from the camera to the first vertex x1)
@@ -26,7 +26,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
 
     # Number of ReSTIR PT proposals per primary sample
-    initial_path_count: int = 2
+    initial_path_count: int = 1
 
     def __init__(self, props):
         super().__init__(props)
@@ -309,9 +309,6 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
     # PATH_LENGTH: Total number of edges, including the camera -> x1 edge.
     def sample_initial_reservoir(self, scene: mi.Scene, sampler: mi.Sampler, frame_id: mi.UInt32, pixel_index: mi.UInt32, ray: mi.RayDifferential3f, active: mi.Mask = True) -> tuple[Reservoir, mi.SurfaceInteraction3f, mi.Mask, mi.Spectrum]:
 
-        # For now, use a fixed reconnection vertex x2
-        k = 2
-
         # Initialize reservoir
         width = dr.width(ray)
         current_reservoir = Reservoir.empty(width)
@@ -336,7 +333,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             path_sampler = create_path_sampler(path_seed, width)
 
             # Trace prefix from x1 to x(k-1), then sample the ray toward xk
-            prefix_throughput, incoming_xk_pdf, ray_to_xk, prefix_radiance, valid_prefix = trace_prefix_throughput(scene=scene, path_sampler=path_sampler, nee_sampler=sampler, k=k, active=valid_ray, max_depth=PATH_LENGTH, x1=x1, ray_x0=ray)
+            prefix_throughput, incoming_xk_pdf, ray_to_xk, prefix_radiance, xk_previous, xk_previous_delta, valid_prefix = trace_prefix_throughput(scene=scene, path_sampler=path_sampler, nee_sampler=sampler, k=k, active=valid_ray, max_depth=PATH_LENGTH, x1=x1, ray_x0=ray)
 
             # Accumulate prefix emission (average across initial paths)
             short_path_radiance += prefix_radiance / self.initial_path_count
@@ -351,20 +348,21 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             Le_xk = emitter_xk.eval(xk, valid_xk)
 
             # Construct the direction sample corresponding to x1 -> xk
-            ds_bsdf = mi.DirectionSample3f(scene, xk, x1)
+            ds_bsdf = mi.DirectionSample3f(scene, xk, xk_previous)
 
             # Evaluate the probability that NEE would sample this emitter
-            emitter_pdf = scene.pdf_emitter_direction(x1, ds_bsdf, active=valid_xk)
+            emitter_pdf = scene.pdf_emitter_direction(xk_previous, ds_bsdf, active=valid_xk)
 
             # Compute the BSDF sampling MIS weight
             mis_bsdf = mis_weight(incoming_xk_pdf, emitter_pdf, selected_index=0, power=2)
-
+            mis_bsdf = dr.select(xk_previous_delta, 1.0, mis_bsdf)
+            
             # Accumulate the weighted emitter contribution
             emission_contribution = prefix_throughput * Le_xk * mis_bsdf
             short_path_radiance += dr.select(valid_xk, emission_contribution / self.initial_path_count, mi.Spectrum(0.0))
 
             # Trace postfix starting at xk
-            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, path_sampler=path_sampler, nee_sampler= sampler, k= mi.UInt32(2),  active=valid_xk, max_depth=PATH_LENGTH)
+            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, path_sampler=path_sampler, nee_sampler= sampler, k= k,  active=valid_xk, max_depth=PATH_LENGTH)
 
             # Evaluate BSDF at xk for the sampled outgoing direction    
             bsdf_xk = xk.bsdf(ray_to_xk)
@@ -403,7 +401,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         # Finalize reservoir
         current_reservoir.finalize(p_hat_selected=selected_p_hat, active=valid_ray)
 
-        return current_reservoir, x1, valid_ray, short_path_radiance
+        return current_reservoir, x1, valid_ray, short_path_radiance 
 
     def sample_temporal_reuse(self, scene: mi.Scene, sensor: mi.Sensor, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, initial_reservoir: Reservoir, valid_ray: mi.Mask, film_width: int, film_height: int, pixel_index: mi.UInt32) -> Reservoir:
         active = valid_ray
