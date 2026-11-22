@@ -8,7 +8,7 @@ from utilsPT import *
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
 
-SPATIAL_NEIGHBOR_COUNT = 3
+SPATIAL_NEIGHBOR_COUNT = 1
 SPATIAL_NEIGHBOR_RADIUS = 10
 
 # PATH_LENGTH : The total number of edges (counting the one from the camera to the first vertex x1)
@@ -307,7 +307,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
     # ReSTIR PT initial reservoir sampling, without NEE.
     # PATH_LENGTH: Total number of edges, including the camera -> x1 edge.
-    def sample_initial_reservoir(self, scene: mi.Scene, reservoir_sampler: mi.Sampler, frame_id: mi.UInt32, pixel_index: mi.UInt32, ray: mi.RayDifferential3f, active: mi.Mask = True) -> tuple[Reservoir, mi.SurfaceInteraction3f, mi.Mask, mi.Spectrum]:
+    def sample_initial_reservoir(self, scene: mi.Scene, sampler: mi.Sampler, frame_id: mi.UInt32, pixel_index: mi.UInt32, ray: mi.RayDifferential3f, active: mi.Mask = True) -> tuple[Reservoir, mi.SurfaceInteraction3f, mi.Mask, mi.Spectrum]:
 
         # For now, use a fixed reconnection vertex x2
         k = 2
@@ -336,7 +336,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             path_sampler = create_path_sampler(path_seed, width)
 
             # Trace prefix from x1 to x(k-1), then sample the ray toward xk
-            prefix_throughput, incoming_xk_pdf, ray_to_xk, prefix_radiance, valid_prefix = trace_prefix_throughput(scene=scene, sampler=path_sampler, k=k, active=valid_ray, max_depth=PATH_LENGTH, x1=x1, ray_x0=ray)
+            prefix_throughput, incoming_xk_pdf, ray_to_xk, prefix_radiance, valid_prefix = trace_prefix_throughput(scene=scene, path_sampler=path_sampler, nee_sampler=sampler, k=k, active=valid_ray, max_depth=PATH_LENGTH, x1=x1, ray_x0=ray)
 
             # Accumulate prefix emission (average across initial paths)
             short_path_radiance += prefix_radiance / self.initial_path_count
@@ -346,13 +346,25 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             xk = preliminary_xk.compute_surface_interaction(ray=ray_to_xk, ray_flags=mi.RayFlags.All, active=valid_prefix)
             valid_xk = valid_prefix & xk.is_valid()
 
-            # Accumulate emission at xk (BSDF-sampled direct illumination for k=2)
+            # Accumulate emission at xk using MIS
             emitter_xk = xk.emitter(scene, valid_xk)
             Le_xk = emitter_xk.eval(xk, valid_xk)
-            short_path_radiance += dr.select(valid_xk, prefix_throughput * Le_xk / self.initial_path_count, mi.Spectrum(0.0))
+
+            # Construct the direction sample corresponding to x1 -> xk
+            ds_bsdf = mi.DirectionSample3f(scene, xk, x1)
+
+            # Evaluate the probability that NEE would sample this emitter
+            emitter_pdf = scene.pdf_emitter_direction(x1, ds_bsdf, active=valid_xk)
+
+            # Compute the BSDF sampling MIS weight
+            mis_bsdf = mis_weight(incoming_xk_pdf, emitter_pdf, selected_index=0, power=2)
+
+            # Accumulate the weighted emitter contribution
+            emission_contribution = prefix_throughput * Le_xk * mis_bsdf
+            short_path_radiance += dr.select(valid_xk, emission_contribution / self.initial_path_count, mi.Spectrum(0.0))
 
             # Trace postfix starting at xk
-            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, sampler=path_sampler, k= mi.UInt32(2),  active=valid_xk, max_depth=PATH_LENGTH - k)
+            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, path_sampler=path_sampler, nee_sampler= sampler, k= mi.UInt32(2),  active=valid_xk, max_depth=PATH_LENGTH)
 
             # Evaluate BSDF at xk for the sampled outgoing direction    
             bsdf_xk = xk.bsdf(ray_to_xk)
@@ -364,20 +376,25 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             safe_pdf = dr.select(bsdf_pdf > 0.0, bsdf_pdf, 1.0)
             bsdf_weight = dr.select(bsdf_pdf > 0.0, bsdf_val / safe_pdf, mi.Spectrum(0.0))
 
-            # Compute full importance-sampled candidate contribution
-            candidate_contribution = prefix_throughput * bsdf_weight * incoming_radiance
+            # Evaluate the NEE at xk 
+            xk_nee, emitter_weight = scene.sample_emitter_direction(xk, sampler.next_2d(valid_xk), True, valid_xk)
+            active_nee = valid_xk & (xk_nee.pdf > 0.0) & dr.isfinite(xk_nee.pdf)
 
             # Construct ReSTIR PT candidate
-            candidate = Sample(outgoingDirection=outgoing_direction, incomingRadiance=incoming_radiance, surfaceInformation=preliminary_xk, seed=path_seed, k=mi.UInt32(k), J=mi.Float(1.0), pdf=incoming_xk_pdf)
+            candidate = Sample(outgoingDirection=outgoing_direction, incomingRadiance=incoming_radiance, surfaceInformation=preliminary_xk, seed=path_seed, k=mi.UInt32(k), J=mi.Float(1.0), pdf=incoming_xk_pdf, nee_sample=xk_nee, nee_valid=active_nee, nee_emitter_weight=emitter_weight)
 
+            # Compute full importance-sampled candidate contribution
+            xk_contribution = eval_xk_contribution(xk, candidate, bsdf_ctx, valid_xk)
+            candidate_contribution = prefix_throughput * xk_contribution
+            
             # Compute reservoir importance weight
             reservoir_weight = mi.luminance(mi.unpolarized_spectrum(candidate_contribution), xk.wavelengths, valid_xk)
             reservoir_weight = dr.select(valid_xk, reservoir_weight, 0.0)
 
             # Add candidate to the reservoir (all valid primary rays count toward M)
-            replace = current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=reservoir_sampler.next_1d(valid_ray), active=valid_ray)
+            replace = current_reservoir.add_sample(sample=candidate, reservoir_weight=reservoir_weight, rnd1D=sampler.next_1d(valid_ray), active=valid_ray)
 
-            # Recover target function by removing the x1 -> x2 proposal PDF
+            # Recover target function by removing the xk-1 -> xk proposal PDF
             p_hat_candidate = reservoir_weight * incoming_xk_pdf
 
             # Save target importance of the selected candidate

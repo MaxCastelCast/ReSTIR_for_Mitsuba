@@ -81,6 +81,15 @@ class Sample:
 
     # Pdf value of initial sampling stage
     pdf: mi.Float = field(default_factory=lambda: mi.Float(0.0))
+
+    # NEE sample generated at the reconnection vertex
+    nee_sample: mi.DirectionSample3f = field(default_factory=mi.DirectionSample3f)
+
+    # Whether the NEE sample is valid
+    nee_valid: mi.Mask = field(default_factory=lambda: mi.Bool(False))
+
+    # Radiance obtained from NEE
+    nee_emitter_weight: mi.Spectrum = field(default_factory=lambda: mi.Spectrum(0.0))
    
     @staticmethod
     def make_empty_sample(width):
@@ -91,7 +100,10 @@ class Sample:
             seed=dr.zeros(mi.UInt32, width),
             k=dr.zeros(mi.UInt32, width),
             J=dr.zeros(mi.Float, width),
-            pdf=dr.zeros(mi.Float, width)
+            pdf=dr.zeros(mi.Float, width),
+            nee_sample=dr.zeros(mi.DirectionSample3f, width),
+            nee_valid=dr.zeros(mi.Bool, width),
+            nee_emitter_weight=dr.zeros(mi.Spectrum, width)
         )
 
 
@@ -198,7 +210,10 @@ def gather_sample(sample: Sample, index: mi.UInt32, active: mi.Mask) -> Sample:
         seed=dr.gather(mi.UInt32, sample.seed, index, active),
         k=dr.gather(mi.UInt32, sample.k, index, active),
         J=dr.gather(mi.Float, sample.J, index, active),
-        pdf=dr.gather(mi.Float, sample.pdf, index, active)
+        pdf=dr.gather(mi.Float, sample.pdf, index, active),
+        nee_sample=dr.gather(mi.DirectionSample3f, sample.nee_sample, index, active),
+        nee_valid=dr.gather(mi.Bool, sample.nee_valid, index, active),
+        nee_emitter_weight=dr.gather(mi.Spectrum, sample.nee_emitter_weight, index, active)
     )
 
 # Gathers the reservoirs associated with the indexes
@@ -219,6 +234,9 @@ def scatter_sample(target: Sample, source: Sample, index: mi.UInt32, active: mi.
     dr.scatter(target.k, source.k, index, active=active)
     dr.scatter(target.J, source.J, index, active=active)
     dr.scatter(target.pdf, source.pdf, index, active=active)
+    dr.scatter(target.nee_sample, source.nee_sample, index, active)
+    dr.scatter(target.nee_emitter_weight, source.nee_emitter_weight, index, active)
+    dr.scatter(target.nee_valid, source.nee_valid, index, active=active)
 
 
 # Store resulting reservoir for next frame
@@ -230,7 +248,7 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
     dr.scatter(previous.W, current.W, index, active=active)
 
 
-def trace_prefix_throughput(scene: mi.Scene, sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, k: mi.UInt32, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple[mi.Spectrum, mi.Float, mi.Ray3f, mi.Spectrum, mi.Mask]:
+def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple[mi.Spectrum, mi.Float, mi.Ray3f, mi.Spectrum, mi.Mask]:
     """
     Trace a path prefix from x1 through x(k-1), then sample
     the outgoing ray toward xk.
@@ -267,17 +285,33 @@ def trace_prefix_throughput(scene: mi.Scene, sampler: dr.llvm.ad.PCG32 | dr.cuda
         # Only lanes that have not reached their final prefix vertex
         trace = valid & (k >= i + 2)
 
+        # Retrieve BSDF at the current vertex
+        bsdf_xi = x_current.bsdf(current_ray)
+
         # Accumulate emission at the current prefix vertex
         emitter = x_current.emitter(scene, trace)
         Le = emitter.eval(x_current, trace)
         prefix_radiance += dr.select(trace, prefix_throughput * Le, mi.Spectrum(0.0))
 
-        # Retrieve BSDF at the current vertex
-        bsdf_xi = x_current.bsdf(current_ray)
+        # Next Event Estimation
+        sample_nee = mi.Point2f(nee_sampler.next_1d(trace), nee_sampler.next_1d(trace))
+        ds_nee, emitter_weight = scene.sample_emitter_direction(x_current, sample_nee, True, trace)
+
+        active_nee = trace & (ds_nee.pdf > 0.0) & dr.isfinite(ds_nee.pdf)
+
+        wo_nee = x_current.to_local(ds_nee.d)
+        bsdf_val_nee, bsdf_pdf_nee = bsdf_xi.eval_pdf(bsdf_ctx, x_current, wo_nee, active_nee)
+        bsdf_val_nee = x_current.to_world_mueller(bsdf_val_nee, -wo_nee, x_current.wi)
+
+        mis_nee = mis_weight(ds_nee.pdf, bsdf_pdf_nee, selected_index=0, power=2)
+        mis_nee = dr.select(ds_nee.delta, 1.0, mis_nee)
+
+        nee_contribution = prefix_throughput * bsdf_val_nee * emitter_weight * mis_nee
+        prefix_radiance += dr.select(active_nee, nee_contribution, mi.Spectrum(0.0))
 
         # Sample BSDF direction
-        sample1 = sampler.next_float(mi.Float, trace)
-        sample2 = mi.Point2f(sampler.next_float(mi.Float, trace), sampler.next_float(mi.Float, trace))
+        sample1 = path_sampler.next_float(mi.Float, trace)
+        sample2 = mi.Point2f(path_sampler.next_float(mi.Float, trace), path_sampler.next_float(mi.Float, trace))
         bs, bsdf_weight = bsdf_xi.sample(bsdf_ctx, x_current, sample1, sample2, trace)
 
         # Check whether sampling succeeded
@@ -325,7 +359,7 @@ def trace_prefix_throughput(scene: mi.Scene, sampler: dr.llvm.ad.PCG32 | dr.cuda
     return prefix_throughput, xk_pdf, ray_to_xk, prefix_radiance, valid
 
 
-def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk: mi.RayDifferential3f, sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5) -> tuple[mi.Spectrum, mi.Vector3f]:
+def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk: mi.RayDifferential3f, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5) -> tuple[mi.Spectrum, mi.Vector3f]:
 
     # 1. Initialize accumulated radiance and throughput
     width = dr.width(xk.p)
@@ -337,56 +371,73 @@ def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk:
     ray = mi.Ray3f(ray_xk)
     bsdf_ctx = mi.BSDFContext()
 
-    # Validate the reconnection index
     active_path = active & xk.is_valid() & (k >= 2) & (k < max_depth)
 
     # 2. Trace the suffix starting at xk
     for depth in range(max_depth - 2):
 
-        # Only lanes with remaining suffix bounces participate
         trace = active_path & (k + depth < max_depth)
 
-        # Sample the BSDF at the current vertex
+        # Retrieve the current BSDF
         bsdf = si.bsdf(ray)
-        sample1 = sampler.next_float(mi.Float, trace)
-        sample2 = mi.Point2f(sampler.next_float(mi.Float, trace), sampler.next_float(mi.Float, trace))
+
+        # 3. NEE at vertices after xk
+        if depth > 0:
+
+            ds_nee, emitter_weight = scene.sample_emitter_direction(si, nee_sampler.next_2d(trace), True, trace)
+            active_nee = trace & (ds_nee.pdf > 0.0) & dr.isfinite(ds_nee.pdf)
+
+            wo_nee = si.to_local(ds_nee.d)
+            bsdf_val_nee, bsdf_pdf_nee = bsdf.eval_pdf(bsdf_ctx, si, wo_nee, active_nee)
+            bsdf_val_nee = si.to_world_mueller(bsdf_val_nee, -wo_nee, si.wi)
+
+            mis_nee = mis_weight(ds_nee.pdf, bsdf_pdf_nee, selected_index=0, power=2)
+            mis_nee = dr.select(ds_nee.delta, 1.0, mis_nee)
+
+            nee_contribution = throughput * bsdf_val_nee * emitter_weight * mis_nee
+            L += dr.select(active_nee, nee_contribution, mi.Spectrum(0.0))
+
+        # 4. BSDF continuation
+        sample1 = path_sampler.next_float(mi.Float, trace)
+        sample2 = mi.Point2f(path_sampler.next_float(mi.Float, trace), path_sampler.next_float(mi.Float, trace))
         bs, bsdf_weight = bsdf.sample(bsdf_ctx, si, sample1, sample2, trace)
 
-        # Check whether BSDF sampling succeeded
         valid_sample = trace & (bs.pdf > 0.0) & dr.isfinite(bs.pdf)
-
-        # Convert BSDF weight to world polarization basis
         bsdf_weight = si.to_world_mueller(bsdf_weight, -bs.wo, si.wi)
 
-        # Compute outgoing direction
-        wo_world = si.to_world(bs.wo)
-
-        # Store the outgoing direction sampled at xk
-        if depth == 0:
-            outgoing_direction = dr.select(valid_sample, wo_world, outgoing_direction)
-
-        # Update throughput, excluding the BSDF at xk
         if depth > 0:
             throughput = dr.select(valid_sample, throughput * bsdf_weight, throughput)
 
-        # Trace the next ray
+        wo_world = si.to_world(bs.wo)
+
+        # 5. Trace next intersection
         next_ray = si.spawn_ray(wo_world)
         next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=valid_sample)
         valid_next = valid_sample & next_si.is_valid()
 
-        # Evaluate emission at the newly reached vertex
+        # 6. Evaluate BSDF-sampled emitter hit
         emitter = next_si.emitter(scene, valid_next)
         Le = emitter.eval(next_si, valid_next)
-        L += dr.select(valid_next, throughput * Le, mi.Spectrum(0.0))
 
-        # Continue only for lanes with remaining suffix bounces
+        ds_bsdf = mi.DirectionSample3f(scene, next_si, si)
+        emitter_pdf = scene.pdf_emitter_direction(si, ds_bsdf, active=valid_next)
+
+        mis_bsdf = mis_weight(bs.pdf, emitter_pdf, selected_index=0, power=2)
+        mis_bsdf = dr.select(mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta), 1.0, mis_bsdf)
+
+        # No NEE is performed at xk
+        if depth == 0:
+            outgoing_direction = wo_world
+        else:
+            mis_bsdf = dr.select(mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta), 1.0, mis_bsdf)
+
+        L += dr.select(valid_next, throughput * Le * mis_bsdf, mi.Spectrum(0.0))
+
+        # 7. Continue the suffix
         continue_path = valid_next & (k + depth + 1 < max_depth)
 
-        # Preserve completed lanes
         si = dr.select(continue_path, next_si, si)
         ray = dr.select(continue_path, next_ray, ray)
-
-        # Terminate unsuccessful paths
         active_path = continue_path
 
     return L, outgoing_direction
@@ -431,16 +482,10 @@ def eval_p_hat_spectrum(scene: mi.Scene, primary_ray: mi.Ray3f, candidate: Sampl
     bsdf_previous = previous_si.bsdf()
     bsdf_val_previous = bsdf_previous.eval(bsdf_ctx, previous_si, wo_local, valid)
 
-    # 3. Evaluate BSDF at xk for the preserved outgoing direction
-    wo_xk_local = reconnection_si.to_local(candidate.outgoingDirection)
-    bsdf_xk = reconnection_si.bsdf()
-    bsdf_val_xk, bsdf_pdf_xk = bsdf_xk.eval_pdf(bsdf_ctx, reconnection_si, wo_xk_local, valid)
-    valid &= (bsdf_pdf_xk > 0.0) & dr.isfinite(bsdf_pdf_xk)
-    safe_pdf_xk = dr.select(valid, bsdf_pdf_xk, 1.0)
-    weight_xk = dr.select(valid, bsdf_val_xk / safe_pdf_xk, mi.Spectrum(0.0))
+    xk_contribution = eval_xk_contribution(reconnection_si, candidate, bsdf_ctx, valid)
 
-    # 4. Compute the complete target contribution
-    target_spectrum = prefix_throughput * bsdf_val_previous * weight_xk * candidate.incomingRadiance
+    # Compute the complete target contribution
+    target_spectrum = prefix_throughput * bsdf_val_previous * xk_contribution
 
     return dr.select(valid, target_spectrum, mi.Spectrum(0.0))
 
@@ -451,6 +496,45 @@ def eval_p_hat(scene: mi.Scene, primary_ray: mi.Ray3f, candidate: Sample, max_k:
     p_hat = mi.luminance( mi.unpolarized_spectrum(target_spectrum), primary_ray.wavelengths, active)
 
     return dr.select(active & dr.isfinite(p_hat) & (p_hat > 0.0), p_hat, 0.0)
+
+
+def eval_xk_contribution(xk: mi.SurfaceInteraction3f, candidate: Sample, bsdf_ctx: mi.BSDFContext, active: mi.Mask) -> mi.Spectrum:
+
+    # 1. Retrieve the BSDF at the reconnection vertex
+    bsdf_xk = xk.bsdf()
+
+    # 2. Evaluate the BSDF-sampled suffix contribution
+    wo_local = xk.to_local(candidate.outgoingDirection)
+    bsdf_val, bsdf_pdf = bsdf_xk.eval_pdf(bsdf_ctx, xk, wo_local, active)
+    bsdf_val = xk.to_world_mueller(bsdf_val, -wo_local, xk.wi)
+    valid_bsdf = active & (bsdf_pdf > 0.0) & dr.isfinite(bsdf_pdf)
+    safe_pdf = dr.select(valid_bsdf, bsdf_pdf, 1.0)
+    bsdf_weight = dr.select(valid_bsdf, bsdf_val / safe_pdf, mi.Spectrum(0.0))
+    suffix_contribution = bsdf_weight * candidate.incomingRadiance
+
+    # 3. Retrieve the stored NEE sample
+    ds_nee = candidate.nee_sample
+    active_nee = active & candidate.nee_valid
+    active_nee &= (ds_nee.pdf > 0.0) & dr.isfinite(ds_nee.pdf)
+
+    # 4. Evaluate the BSDF toward the sampled emitter
+    wo_nee = xk.to_local(ds_nee.d)
+    bsdf_val_nee, bsdf_pdf_nee = bsdf_xk.eval_pdf(bsdf_ctx, xk, wo_nee, active_nee)
+    bsdf_val_nee = xk.to_world_mueller(bsdf_val_nee, -wo_nee, xk.wi)
+
+    # 5. Compute the NEE MIS weight
+    mis_nee = mis_weight(ds_nee.pdf, bsdf_pdf_nee, selected_index=0, power=2)
+    mis_nee = dr.select(ds_nee.delta, 1.0, mis_nee)
+
+    # 6. Evaluate the NEE contribution
+    nee_contribution = bsdf_val_nee * candidate.nee_emitter_weight * mis_nee
+    nee_contribution = dr.select(active_nee, nee_contribution, mi.Spectrum(0.0))
+
+    # 7. Combine both estimators
+    xk_contribution = suffix_contribution + nee_contribution
+
+    return dr.select(active, xk_contribution, mi.Spectrum(0.0))
+
 
 # Get the indexes of the previous frame reservoirs that correspond to the current frame pixels
 def eval_previous_index(si: mi.SurfaceInteraction3f, previous_sensor: mi.Sensor, current_sensor: mi.Sensor, sampler: mi.Sampler,  film_width: int, film_height: int, pixel_index: mi.UInt32, active: mi.Mask) -> tuple[mi.UInt32, mi.Bool]:
@@ -550,17 +634,12 @@ def shift_mapping(scene: mi.Scene, temporal_preliminary_ray: mi.Ray3f, temporal_
     wi_world = delta_back * dr.rsqrt(safe_dist2_back)
     xk_shifted.wi = xk_shifted.to_local(wi_world)
 
-    # 6. Evaluate the preserved suffix at xk
-    wo_xk_local = xk_shifted.to_local(candidate.outgoingDirection)
-    bsdf_xk = xk_shifted.bsdf()
-    bsdf_val_xk, bsdf_pdf_x2 = bsdf_xk.eval_pdf(bsdf_ctx, xk_shifted, wo_xk_local, valid)
-    valid &= dr.isfinite(bsdf_pdf_x2) & (bsdf_pdf_x2 > 0.0)
-    safe_pdf_x2 = dr.select(valid, bsdf_pdf_x2, 1.0)
-    weight_xk = dr.select(valid, bsdf_val_xk / safe_pdf_x2, mi.Spectrum(0.0))
+    # Evaluate the preserved suffix and NEE using the shifted incoming direction
+    xk_contribution = eval_xk_contribution(xk_shifted, candidate, bsdf_ctx, valid)
 
     # 7. Calculate the target function
-    target_prefix_pdf = target_bsdf_pdf * prefix_path_pdf_y
-    target_spectrum = yk_prefix_throughput * bsdf_val_yk_previous * weight_xk * candidate.incomingRadiance
+    target_prefix_pdf = prefix_path_pdf_y * target_bsdf_pdf
+    target_spectrum = yk_prefix_throughput * bsdf_val_yk_previous * xk_contribution
     p_hat_temporal = mi.luminance(mi.unpolarized_spectrum(target_spectrum), yk_previous.wavelengths, valid)
     valid &= dr.isfinite(p_hat_temporal) & (p_hat_temporal > 0.0)
 
