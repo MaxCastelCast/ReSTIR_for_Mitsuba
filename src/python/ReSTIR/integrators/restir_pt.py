@@ -8,8 +8,11 @@ from utilsPT import *
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
 
-SPATIAL_NEIGHBOR_COUNT = 2
-SPATIAL_NEIGHBOR_RADIUS = 10
+SPATIAL_NEIGHBOR_COUNT = 1
+SPATIAL_NEIGHBOR_RADIUS = 3
+
+IS_TEMPORAL_ACTIVE = False
+IS_SPACIAL_ACTIVE = False
 
 # PATH_LENGTH : The total number of edges (counting the one from the camera to the first vertex x1)
 PATH_LENGTH = 6
@@ -210,48 +213,17 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
                 scatter_x1_geometry_buffer(self.current_x1_buffer, current_geometry, pixel_index, active=mi.Bool(True))
 
                 sampler.schedule_state()
-                dr.eval(
-                    initial_reservoir.w_sum,
-                    initial_reservoir.M,
-                    initial_reservoir.W,
-                    initial_reservoir.select.pdf,
-                    initial_reservoir.select.J,
-                    initial_reservoir.select.seed,
-                    initial_reservoir.select.incomingRadiance,
-                    initial_reservoir.select.outgoingDirection,
-                    si.p, si.n, si.sh_frame.n, si.wi, si.uv, 
-                    valid_ray,
-                    self.current_x1_buffer.x1_pos,
-                    self.current_x1_buffer.x1_norm
-                )
+                dr.eval(initial_reservoir, si, valid_ray, short_path_radiance, ray, self.current_x1_buffer)
 
                 temporal_reservoir = self.sample_temporal_reuse(scene, sensor, sampler, ray, si, initial_reservoir, valid_ray, film_width, film_height, pixel_index)
 
                 sampler.schedule_state()
-                dr.eval(
-                    temporal_reservoir.w_sum,
-                    temporal_reservoir.M,
-                    temporal_reservoir.W,
-                    temporal_reservoir.select.pdf,
-                    temporal_reservoir.select.J,
-                    temporal_reservoir.select.seed,
-                    temporal_reservoir.select.incomingRadiance,
-                    temporal_reservoir.select.outgoingDirection,
-                )
+                dr.eval(temporal_reservoir)
 
                 spacial_reservoir = self.sample_spatial_reuse(scene=scene, sampler=sampler, ray=ray, si=si, initial_reservoir=temporal_reservoir, valid_ray=valid_ray, film_width=film_width, film_height=film_height, pixel_index=pixel_index)
 
                 sampler.schedule_state()
-                dr.eval(
-                    spacial_reservoir.w_sum,
-                    spacial_reservoir.M,
-                    spacial_reservoir.W,
-                    spacial_reservoir.select.pdf,
-                    spacial_reservoir.select.J,
-                    spacial_reservoir.select.seed,
-                    spacial_reservoir.select.incomingRadiance,
-                    spacial_reservoir.select.outgoingDirection,
-                )
+                dr.eval(spacial_reservoir)
 
                 # Evaluate the selected reservoir
                 L = self.evaluate_reservoir(scene=scene, sampler=sampler, ray=ray, si=si, reservoir=spacial_reservoir, valid_ray=valid_ray, direct_emission=short_path_radiance)
@@ -264,16 +236,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
                 scatter_reservoir(self.currentGrid, temporal_reservoir, pixel_index, valid_ray)
 
                 sampler.schedule_state()
-                dr.eval(
-                    self.currentGrid.w_sum,
-                    self.currentGrid.M,
-                    self.currentGrid.W,
-                    self.currentGrid.select.pdf,
-                    self.currentGrid.select.J,
-                    self.currentGrid.select.seed,
-                    self.currentGrid.select.incomingRadiance,
-                    self.currentGrid.select.outgoingDirection,
-                )
+                dr.eval(self.currentGrid, self.current_x1_buffer)
 
                 self.previousGrid, self.currentGrid = (self.currentGrid, self.previousGrid)
                 self.previous_x1_buffer, self.current_x1_buffer = (self.current_x1_buffer, self.previous_x1_buffer)
@@ -333,7 +296,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             path_sampler = create_path_sampler(path_seed, width)
 
             # Trace prefix from x1 to x(k-1), then sample the ray toward xk
-            prefix_throughput, incoming_xk_pdf, ray_to_xk, prefix_radiance, xk_previous, xk_previous_delta, valid_prefix = trace_prefix_throughput(scene=scene, path_sampler=path_sampler, nee_sampler=sampler, k=k, active=valid_ray, max_depth=PATH_LENGTH, x1=x1, ray_x0=ray)
+            prefix_throughput, incoming_xk_pdf, ray_to_xk, prefix_radiance, xk_previous, xk_previous_delta, selected_k, valid_prefix = trace_prefix_throughput(scene=scene, path_sampler=path_sampler, nee_sampler=sampler, active=valid_ray, max_depth=PATH_LENGTH, x1=x1, ray_x0=ray)
 
             # Accumulate prefix emission (average across initial paths)
             short_path_radiance += prefix_radiance / self.initial_path_count
@@ -362,7 +325,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             short_path_radiance += dr.select(valid_xk, emission_contribution / self.initial_path_count, mi.Spectrum(0.0))
 
             # Trace postfix starting at xk
-            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, path_sampler=path_sampler, nee_sampler= sampler, k= k,  active=valid_xk, max_depth=PATH_LENGTH)
+            incoming_radiance, outgoing_direction = trace_postfix_radiance(scene=scene, xk=xk, ray_xk=ray_to_xk, path_sampler=path_sampler, nee_sampler= sampler, k= selected_k,  active=valid_xk, max_depth=PATH_LENGTH)
 
             # Evaluate BSDF at xk for the sampled outgoing direction    
             bsdf_xk = xk.bsdf(ray_to_xk)
@@ -379,7 +342,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             active_nee = valid_xk & (xk_nee.pdf > 0.0) & dr.isfinite(xk_nee.pdf)
 
             # Construct ReSTIR PT candidate
-            candidate = Sample(outgoingDirection=outgoing_direction, incomingRadiance=incoming_radiance, surfaceInformation=preliminary_xk, seed=path_seed, k=mi.UInt32(k), J=mi.Float(1.0), pdf=incoming_xk_pdf, nee_sample=xk_nee, nee_valid=active_nee, nee_emitter_weight=emitter_weight)
+            candidate = Sample(outgoingDirection=outgoing_direction, incomingRadiance=incoming_radiance, surfaceInformation=preliminary_xk, seed=path_seed, k=mi.UInt32(selected_k), J=mi.Float(1.0), pdf=incoming_xk_pdf, nee_sample=xk_nee, nee_valid=active_nee, nee_emitter_weight=emitter_weight)
 
             # Compute full importance-sampled candidate contribution
             xk_contribution = eval_xk_contribution(xk, candidate, bsdf_ctx, valid_xk)
@@ -407,7 +370,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         active = valid_ray
 
         # No temporal history yet
-        if self.previous_camera is None:
+        if self.previous_camera is None and IS_TEMPORAL_ACTIVE:
             return initial_reservoir
 
         # 1) Determine which temporal sample corresponds to our current pixel
@@ -425,7 +388,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
         # If the shift mapping is not successful, we cannot use the previous sample for temporal reuse and we keep the current sample as is
         temporal_primary_ray = previous_x1_geometry.primary_ray
         current_primary_ray = mi.Ray3f(ray)
-        J, p_hat_temporal, target_bsdf_pdf, valid_shift_mapping = shift_mapping(scene, temporal_primary_ray, previous_reservoir, current_primary_ray, initial_reservoir,previous_index, sampler,  active_history)
+        J, p_hat_temporal, target_bsdf_pdf, valid_shift_mapping = shift_mapping(scene=scene, temporal_preliminary_ray=temporal_primary_ray, temporal_reservoir=previous_reservoir, current_preliminary_ray=current_primary_ray, max_depth=PATH_LENGTH, active=active_history)
 
 
         # Current strategy evaluated at the freshly generated initial candidate
@@ -468,6 +431,10 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
     def sample_spatial_reuse(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.RayDifferential3f, si: mi.SurfaceInteraction3f, initial_reservoir: Reservoir, valid_ray: mi.Mask, film_width: int, film_height: int, pixel_index: mi.UInt32) -> Reservoir:
 
+
+        if not IS_SPACIAL_ACTIVE:
+            return initial_reservoir
+
         active = valid_ray
         bsdf_ctx = mi.BSDFContext()
         current_primary_ray = mi.Ray3f(ray)
@@ -499,7 +466,7 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
             valid_candidate_source = strategy_enabled & (neighbor_reservoir.W > 0.0)
 
             # Shift the selected candidate
-            J, p_hat_spatial, target_bsdf_pdf, valid_shift = shift_mapping(scene, neighbor_primary_ray, neighbor_reservoir, current_primary_ray, initial_reservoir, neighbor_index, sampler, valid_candidate_source)
+            J, p_hat_spatial, target_bsdf_pdf, valid_shift = shift_mapping(scene=scene, temporal_preliminary_ray=neighbor_primary_ray, temporal_reservoir=neighbor_reservoir, current_preliminary_ray=current_primary_ray, max_depth=PATH_LENGTH, active=valid_candidate_source)
 
             valid_shift &= (J > 0.0) & dr.isfinite(J)
             valid_shift &= (p_hat_spatial > 0.0) & dr.isfinite(p_hat_spatial)
