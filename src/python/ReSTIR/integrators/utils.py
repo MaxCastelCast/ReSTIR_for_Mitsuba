@@ -2,7 +2,6 @@ import mitsuba as mi
 import drjit as dr
 from dataclasses import dataclass, field
 
-mi.set_variant("llvm_ad_rgb")
 
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9

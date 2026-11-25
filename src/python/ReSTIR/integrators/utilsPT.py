@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
-MAX_PATH_LENGTH = 8
+MAX_PATH_LENGTH = 6
 
 SHIFT_MAPPING_DISTANCE_THRESHOLD = 1e-3
 
@@ -247,19 +247,37 @@ def scatter_reservoir(previous: Reservoir, current: Reservoir, index: mi.UInt32,
     dr.scatter(previous.M, current.M, index, active=active)
     dr.scatter(previous.W, current.W, index, active=active)
 
+def is_pure_diffuse(bsdf: mi.BSDF) -> mi.Mask:
+    flags = bsdf.flags()
+    has_diffuse = mi.has_flag(flags, mi.BSDFFlags.Diffuse)
+    has_glossy = mi.has_flag(flags, mi.BSDFFlags.Glossy)
+    has_delta = mi.has_flag(flags, mi.BSDFFlags.Delta)
+    has_null = mi.has_flag(flags, mi.BSDFFlags.Null)
+    return has_diffuse & ~has_glossy & ~has_delta & ~has_null
 
-def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple[mi.Spectrum, mi.Float, mi.Ray3f, mi.Spectrum, mi.SurfaceInteraction3f, mi.Bool, mi.Mask]:
+def reconnection_eligible(previous_si: mi.SurfaceInteraction3f, current_si: mi.SurfaceInteraction3f, active: mi.Mask) -> mi.Mask:
+    previous_bsdf = previous_si.bsdf()
+    current_bsdf = current_si.bsdf()
+    previous_diffuse = is_pure_diffuse(previous_bsdf)
+    current_diffuse = is_pure_diffuse(current_bsdf)
+    distance_squared = dr.squared_norm(current_si.p - previous_si.p)
+    valid_distance = distance_squared > SHIFT_MAPPING_DISTANCE_THRESHOLD ** 2
+    return active & previous_si.is_valid() & current_si.is_valid() & previous_diffuse & current_diffuse & valid_distance
+
+
+def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, active: mi.Mask, max_depth: int = 5, x1: mi.SurfaceInteraction3f | None = None, ray_x0: mi.RayDifferential3f | None = None) -> tuple:
     """
-    Trace a path prefix from x1 through x(k-1), then sample
-    the outgoing ray toward xk.
+    Trace a path prefix until the first eligible reconnection pair (x(k-1), xk) is found.
 
     Returns:
         prefix_throughput: Product of BSDF sampling weights at x1,...,x(k-1).
-        xk_pdf: PDF of the BSDF direction sampled at x(k-1) toward xk.
-        xk_incoming_ray: Ray from x(k-1) toward xk.
-        prefix_radiance: Accumulated emission from x1,...,x(k-1).
-        valid: Mask indicating successful prefix sampling (does not guarantee that the ray hits xk).
-        xk_previous: Surface interaction at x(k-1), where the ray toward xk was sampled.
+        xk_pdf: BSDF PDF of the direction sampled at x(k-1) toward xk.
+        ray_to_xk: Ray from x(k-1) toward xk.
+        prefix_radiance: Accumulated emission and NEE before xk.
+        xk_previous: Surface interaction at x(k-1).
+        xk_delta: Whether the BSDF event toward xk was delta.
+        selected_k: Selected reconnection index.
+        found_reconnection: Mask indicating successful reconnection.
     """
 
     # 1. Initialize the first surface interaction
@@ -267,8 +285,9 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
         x1 = scene.ray_intersect(ray_x0, active=active)
 
     width = dr.width(ray_x0)
-    valid = active & x1.is_valid()
-    valid &= (k >= 2) & (k <= max_depth)
+    searching = active & x1.is_valid()
+    found_reconnection = dr.zeros(mi.Bool, width)
+    selected_k = dr.zeros(mi.UInt32, width)
 
     # 2. Initialize prefix information
     prefix_throughput = dr.full(mi.Spectrum, 1.0, width)
@@ -286,11 +305,12 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
     previous_delta = dr.zeros(mi.Bool, width)
     xk_delta = dr.zeros(mi.Bool, width)
 
-    # 3. Trace vertices x1,...,x(k-1)
-    for i in range(max_depth - 1):
+    # 3. Trace vertices until an eligible reconnection is found
+    for i in range(max_depth - 2):
 
-        # Only lanes that have not reached their final prefix vertex
-        trace = valid & (k >= i + 2)
+        # Candidate reconnection index
+        candidate_k = i + 2
+        trace = searching
 
         # Retrieve BSDF at the current vertex
         bsdf_xi = x_current.bsdf(current_ray)
@@ -299,35 +319,21 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
         emitter = x_current.emitter(scene, trace)
         Le = emitter.eval(x_current, trace)
 
-        # The first camera intersection does not require MIS
+        # Apply MIS to BSDF-sampled emitter hits
         mis_bsdf = dr.ones(mi.Float, width)
-
-        # Only vertices reached through BSDF sampling require MIS
-        active_mis = trace & (i > 0) 
-
-        # Construct the direction sample for the previous BSDF connection
+        active_mis = trace & (i > 0)
         ds_bsdf = mi.DirectionSample3f(scene, x_current, previous_si)
-
-        # Evaluate the NEE PDF for that connection
         emitter_pdf = scene.pdf_emitter_direction(previous_si, ds_bsdf, active=active_mis)
-
-        # Compute the BSDF MIS weight
         mis_previous = mis_weight(previous_bsdf_pdf, emitter_pdf, selected_index=0, power=2)
-
-        # Delta BSDF events cannot be sampled by ordinary NEE
         mis_previous = dr.select(previous_delta, 1.0, mis_previous)
-
-        # Apply MIS only to vertices after x1
         mis_bsdf = dr.select(active_mis, mis_previous, 1.0)
 
-        # Accumulate the weighted emission
         emission_contribution = prefix_throughput * Le * mis_bsdf
-        prefix_radiance += dr.select(trace, emission_contribution, mi.Spectrum(0.0))        
+        prefix_radiance += dr.select(trace, emission_contribution, mi.Spectrum(0.0))
 
         # Next Event Estimation
         sample_nee = mi.Point2f(nee_sampler.next_1d(trace), nee_sampler.next_1d(trace))
         ds_nee, emitter_weight = scene.sample_emitter_direction(x_current, sample_nee, True, trace)
-
         active_nee = trace & (ds_nee.pdf > 0.0) & dr.isfinite(ds_nee.pdf)
 
         wo_nee = x_current.to_local(ds_nee.d)
@@ -357,51 +363,45 @@ def trace_prefix_throughput(scene: mi.Scene, path_sampler: dr.llvm.ad.PCG32 | dr
         # Generate ray toward the next vertex
         wo_world = x_current.to_world(bs.wo)
         next_ray = x_current.spawn_ray(wo_world)
+        sampled_delta = mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta)
 
-        # Store the information needed for MIS at the next vertex
-        continue_path = valid_sample & (k > i + 2)
+        # Intersect the next vertex
+        next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=valid_sample)
+        valid_next = valid_sample & next_si.is_valid()
 
+        # Test reconnection eligibility
+        eligible = reconnection_eligible(x_current, next_si, valid_next)
+
+        # Save the first eligible reconnection
+        selected_k = dr.select(eligible, mi.UInt32(candidate_k), selected_k)
+        xk_delta = dr.select(eligible, sampled_delta, xk_delta)
+        xk_pdf = dr.select(eligible, bs.pdf, xk_pdf)
+        ray_to_xk = dr.select(eligible, next_ray, ray_to_xk)
+        xk_previous = dr.select(eligible, x_current, xk_previous)
+
+        # Remember which lanes have found a reconnection
+        found_reconnection |= eligible
+
+        # Continue searching only for unfinished lanes
+        continue_path = valid_next & ~eligible
+
+        # Store BSDF sampling information for MIS at the next prefix vertex
         previous_si = dr.select(continue_path, x_current, previous_si)
         previous_bsdf_pdf = dr.select(continue_path, bs.pdf, previous_bsdf_pdf)
-        sampled_delta = mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta)
         previous_delta = dr.select(continue_path, sampled_delta, previous_delta)
 
-        # 4. Identify lanes that have reached x(k-1)
-        reached_last_vertex = valid_sample & (k == i + 2)
-
-        # Test if this interaction is with a delta surface 
-        xk_delta = dr.select(reached_last_vertex, sampled_delta, xk_delta)
-
-        # Save the final BSDF PDF
-        xk_pdf = dr.select(reached_last_vertex, bs.pdf, xk_pdf)
-
-        # Save the final ray toward xk
-        ray_to_xk = dr.select(reached_last_vertex, next_ray, ray_to_xk)
-
-        # Save the vertex xk_previous
-        xk_previous = dr.select(reached_last_vertex, x_current, xk_previous)
-
-        # 5. Continue only for lanes that need another prefix vertex
-        continue_path = valid_sample & (k > i + 2)
-
-        # Intersect the next prefix vertex
-        next_si = scene.ray_intersect(next_ray, ray_flags=mi.RayFlags.All, coherent=False, active=continue_path)
-
-        # Validate the next intersection
-        valid_next = continue_path & next_si.is_valid()
-
-        # Update validity only for lanes that were tracing
-        valid &= ~trace | (valid_sample & ((k == i + 2) | valid_next))
-
         # Advance only unfinished paths
-        x_current = dr.select(valid_next, next_si, x_current)
-        current_ray = dr.select(valid_next, next_ray, current_ray)
+        x_current = dr.select(continue_path, next_si, x_current)
+        current_ray = dr.select(continue_path, next_ray, current_ray)
 
-    # 6. Mask invalid final outputs
-    prefix_throughput = dr.select(valid, prefix_throughput, mi.Spectrum(0.0))
-    xk_pdf = dr.select(valid, xk_pdf, 0.0)
+        # Update the searching mask
+        searching = continue_path
 
-    return prefix_throughput, xk_pdf, ray_to_xk, prefix_radiance, xk_previous, xk_delta, valid
+    # 4. Mask invalid final outputs
+    prefix_throughput = dr.select(found_reconnection, prefix_throughput, mi.Spectrum(0.0))
+    xk_pdf = dr.select(found_reconnection, xk_pdf, 0.0)
+
+    return prefix_throughput, xk_pdf, ray_to_xk, prefix_radiance, xk_previous, xk_delta, selected_k, found_reconnection
 
 
 def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk: mi.RayDifferential3f, path_sampler: dr.llvm.ad.PCG32 | dr.cuda.ad.PCG32, nee_sampler: mi.Sampler, k: mi.UInt32, active: mi.Mask, max_depth: int = 5) -> tuple[mi.Spectrum, mi.Vector3f]:
@@ -451,7 +451,7 @@ def trace_postfix_radiance(scene: mi.Scene, xk: mi.SurfaceInteraction3f, ray_xk:
         bsdf_weight = si.to_world_mueller(bsdf_weight, -bs.wo, si.wi)
 
         if depth > 0:
-            throughput = dr.select(valid_sample, throughput * bsdf_weight, throughput)
+            throughput = dr.select(valid_sample, throughput * bsdf_weight, mi.Spectrum(0.0))
 
         wo_world = si.to_world(bs.wo)
 
@@ -638,7 +638,7 @@ def eval_selected_neighbor(sampler: mi.Sampler,  film_width: int, film_height: i
 
     return neighbor_index, valid_neighbor
 
-def shift_mapping(scene: mi.Scene, temporal_preliminary_ray: mi.Ray3f, temporal_reservoir: Reservoir, current_preliminary_ray: mi.Ray3f, current_reservoir: Reservoir, previous_index: mi.UInt32, current_sampler: mi.Sampler, active: mi.Mask) -> tuple[mi.Float, mi.Float, mi.Float, mi.Mask]:
+def shift_mapping(scene: mi.Scene, temporal_preliminary_ray: mi.Ray3f, temporal_reservoir: Reservoir, current_preliminary_ray: mi.Ray3f, max_depth: int , active: mi.Mask) -> tuple[mi.Float, mi.Float, mi.Float, mi.Mask]:
     bsdf_ctx = mi.BSDFContext()
     candidate = temporal_reservoir.select
     width = dr.width(current_preliminary_ray)

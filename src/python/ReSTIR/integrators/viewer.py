@@ -1529,6 +1529,10 @@ def run() -> None:
 
     print("2. Mitsuba initialized", flush=True)
 
+    # if os.getenv("RESTIR_DEBUG") == "1":
+    #     dr.set_log_level(dr.LogLevel.Debug)
+    #     mi.set_log_level(mi.LogLevel.Debug)
+
     import temp_reuse
     import ris_di
     import restir_di

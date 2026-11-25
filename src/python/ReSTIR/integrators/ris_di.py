@@ -2,9 +2,6 @@ import mitsuba as mi
 import drjit as dr
 from dataclasses import dataclass
 
-mi.set_variant("llvm_ad_rgb")
-dr.set_flag(dr.JitFlag.Debug, True)
-
 
 def mis_weight(pdf_a: mi.Float, pdf_b: mi.Float, n_a: float, n_b: float, power: int = 2) -> mi.Float:
     """Compute the MIS weight using the power heuristic."""
