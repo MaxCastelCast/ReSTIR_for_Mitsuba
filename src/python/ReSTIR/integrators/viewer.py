@@ -37,7 +37,8 @@ INTEGRATORS = (
     IntegratorChoice("RIS DI", "direct_ris"),
     IntegratorChoice("Temporal Reuse", "temp_reuse"),
     IntegratorChoice("ReSTIR DI", "restir_di"),
-    IntegratorChoice("ReSTIR GI", "restir_gi")
+    IntegratorChoice("ReSTIR GI", "restir_gi"),
+    IntegratorChoice("ReSTIR PT", "restir_pt")
 )
 
 
@@ -695,7 +696,7 @@ class MitsubaRenderer:
 
 
         # Initialize ReSTIR temporal state outside dr.freeze
-        if isinstance(self.integrator, restir_di.Restir_Di_Integrator) or isinstance(self.integrator, restir_gi.Restir_Gi_Integrator):
+        if isinstance(self.integrator, restir_di.Restir_Di_Integrator) or isinstance(self.integrator, restir_gi.Restir_Gi_Integrator) or isinstance(self.integrator, restir_pt.Restir_PT_Integrator):
             if self.integrator.previous_camera is None:
                 self.integrator.prepare_frame(self.sensor)
 
@@ -711,7 +712,7 @@ class MitsubaRenderer:
         )
 
         # Call Prepare next frame for ReSTIR
-        if isinstance(self.integrator, restir_di.Restir_Di_Integrator) or isinstance(self.integrator, restir_gi.Restir_Gi_Integrator):
+        if isinstance(self.integrator, restir_di.Restir_Di_Integrator) or isinstance(self.integrator, restir_gi.Restir_Gi_Integrator) or isinstance(self.integrator, restir_pt.Restir_PT_Integrator):
             self.integrator.prepare_next_frame(self.sensor)
 
         if not denoise:
@@ -1514,7 +1515,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run() -> None:
-    global temp_reuse, ris_di, restir_di, restir_gi
+    global temp_reuse, ris_di, restir_di, restir_gi, restir_pt
 
     print("1. Entered run()", flush=True)
 
@@ -1528,10 +1529,15 @@ def run() -> None:
 
     print("2. Mitsuba initialized", flush=True)
 
+    # if os.getenv("RESTIR_DEBUG") == "1":
+    #     dr.set_log_level(dr.LogLevel.Debug)
+    #     mi.set_log_level(mi.LogLevel.Debug)
+
     import temp_reuse
     import ris_di
     import restir_di
     import restir_gi
+    import restir_pt
 
     print("3. Custom integrators imported", flush=True)
 

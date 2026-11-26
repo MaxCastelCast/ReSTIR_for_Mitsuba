@@ -145,7 +145,6 @@ def combine_reservoirs(scene: mi.Scene, current_si: mi.SurfaceInteraction3f, bsd
             occluded = scene.ray_test(shadow_ray, valid_J)
             visible = ~occluded
 
-            # TODO : if we add visibility check here, it isn't p_hat anymore, why we must do a visibility check here ?
             # This is a tradoff to remove bias
             # Set the p_hat evalutation to 0 if the sample is occluded 
             p_hat = dr.select(visible, p_hat, 0.0)

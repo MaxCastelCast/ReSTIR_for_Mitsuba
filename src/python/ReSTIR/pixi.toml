@@ -15,6 +15,9 @@ mitsuba = "==3.9.0"
 
 nanogui = { git = "https://github.com/mitsuba-renderer/nanogui.git", rev = "d50f6c15d30133b43217028fe7915f09ee79db87" }
 
+[activation.env]
+RESTIR_DEBUG = "1"
+
 [tasks]
 
 # Verify that Mitsuba and Dr.Jit can initialize CUDA
@@ -23,5 +26,14 @@ test-cuda = "python -c \"import mitsuba as mi; import drjit as dr; mi.set_varian
 # Verify that NanoGUI and its Dr.Jit interoperability module are available
 test-nanogui = "python -c \"import nanogui as ng; from nanogui.interop import FrameStream, drjit_sink; print('NanoGUI OK')\""
 
-# Launch the ReSTIR viewer
-viewer = "cd integrators && __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia python -m viewer --variant cuda_ad_rgb"
+# Launch the ReSTIR viewer using CUDA
+[tasks.viewer-cuda]
+cmd = "bash -c 'python -u -m viewer --variant cuda_ad_rgb'"
+cwd = "integrators"
+env = { __NV_PRIME_RENDER_OFFLOAD = "1", __GLX_VENDOR_LIBRARY_NAME = "nvidia", RESTIR_DEBUG = "1" }
+
+# Launch the ReSTIR viewer using LLVM (CPU)
+[tasks.viewer-llvm]
+cmd = "bash -c 'python -u -m viewer --variant llvm_ad_rgb'"
+cwd = "integrators"
+env = { RESTIR_DEBUG = "1" }
