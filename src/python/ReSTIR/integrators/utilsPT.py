@@ -7,7 +7,7 @@ POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
 MAX_PATH_LENGTH = 6
 
-SHIFT_MAPPING_DISTANCE_THRESHOLD = 1e-3
+SHIFT_MAPPING_DISTANCE_THRESHOLD = 0.05
 
 
 def mis_weight(*pdfs: mi.Float, selected_index: int = 0, power: int = 2, sample_counts: tuple | None = None) -> mi.Float:
@@ -1100,3 +1100,11 @@ def reconstruct_reconnection_vertex(scene: mi.Scene, current_si: mi.SurfaceInter
     valid &= xk.is_valid()
 
     return xk, valid
+
+def apply_M_cap(previous_reservoir : Reservoir, m_cap: int):
+    old_M = previous_reservoir.M
+    new_M = dr.minimum(old_M, m_cap)
+    scale = mi.Float(new_M) / dr.maximum(mi.Float(old_M), 1.0)
+
+    previous_reservoir.w_sum *= scale
+    previous_reservoir.M = new_M

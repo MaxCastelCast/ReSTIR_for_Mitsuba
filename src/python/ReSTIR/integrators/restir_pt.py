@@ -9,9 +9,12 @@ POSITION_THRESHOLD = 0.05
 NORMAL_THRESHOLD = 0.9
 
 SPATIAL_NEIGHBOR_COUNT = 1
-SPATIAL_NEIGHBOR_RADIUS = 3
+SPATIAL_NEIGHBOR_RADIUS = 5
+TEMPORAL_M_CAP = 20
 
-IS_TEMPORAL_ACTIVE = False
+IS_TEMPORAL_ACTIVE = True
+
+# TODO : Make Spacial Reuse Compile correctly
 IS_SPACIAL_ACTIVE = False
 
 # PATH_LENGTH : The total number of edges (counting the one from the camera to the first vertex x1)
@@ -378,6 +381,9 @@ class Restir_PT_Integrator(mi.ad.integrators.common.ADIntegrator):
 
         # Gather previous-frame reservoir
         previous_reservoir = gather_reservoir(self.previousGrid, previous_index, valid_reprojection)
+
+        # Apply M-cap to avoid historical sample dominance
+        apply_M_cap(previous_reservoir=previous_reservoir, m_cap=TEMPORAL_M_CAP)
         
         # Get previous X1 geometry to know from were our paths start from
         previous_x1_geometry = gather_x1_geometry_buffer(self.previous_x1_buffer, previous_index, valid_reprojection)
